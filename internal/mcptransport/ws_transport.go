@@ -1,3 +1,7 @@
+// Portions of this file are based on googlecolab/colab-mcp,
+// licensed under the Apache License, Version 2.0.
+// This file has been adapted for the Go implementation.
+
 package mcptransport
 
 import (

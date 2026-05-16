@@ -78,3 +78,20 @@ go test ./...
 go vet ./...
 go test -race ./...
 ```
+
+## Attribution
+
+This project is a Go port of
+[`googlecolab/colab-mcp`](https://github.com/googlecolab/colab-mcp).
+
+Portions of this project are based on `googlecolab/colab-mcp` and are used
+under the Apache License, Version 2.0.
+
+This project is not an official Google product.
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See the
+LICENSE file for details.
+
+`googlecolab/colab-mcp` is licensed under the Apache License, Version 2.0.
