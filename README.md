@@ -1,5 +1,9 @@
 # colab-mcp-go
 
+<p align="center">
+  <img src="assets/logo.jpg" alt="colab-mcp-go logo" width="640">
+</p>
+
 `colab-mcp-go` is a Go port of the local bridge from
 [`googlecolab/colab-mcp`](https://github.com/googlecolab/colab-mcp). It runs as
 a single local MCP server binary and does not require Python, `uv`, FastMCP,
