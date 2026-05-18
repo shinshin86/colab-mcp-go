@@ -14,25 +14,75 @@ The current upstream bridge and Colab UI path use MCP tools and
 `notifications/tools/list_changed`; prompts/resources are not exposed by the
 checked Python bridge source.
 
-## Build
+## Install
+
+```sh
+go install github.com/shinshin86/colab-mcp-go/cmd/colab-mcp-go@latest
+```
+
+Requires Go 1.25+. The binary is placed in `$(go env GOPATH)/bin`. Make sure
+that directory is on `PATH`, or use the absolute path in the configs below.
+
+To build from a local checkout instead:
 
 ```sh
 go build ./cmd/colab-mcp-go
 ```
 
-## MCP Client Config
+## Quickstart
+
+`open_colab_browser_connection` blocks until you have opened the Colab tab in
+your browser. The examples below give it up to five minutes, which is usually
+enough for a fresh Google sign-in. Tune `--connect-timeout` (and the matching
+client-side timeout) to taste.
+
+### Claude Code
+
+```sh
+claude mcp add colab-mcp -s user -- \
+  "$(go env GOPATH)/bin/colab-mcp-go" \
+  --connect-timeout 300s
+```
+
+Use `-s local` to scope the server to the current project instead of all
+projects. After running `claude mcp add`, restart Claude Code so the new
+session picks up the server; then call the `open_colab_browser_connection`
+tool.
+
+### Codex CLI
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.colab-mcp]
+command = "/absolute/path/to/colab-mcp-go"
+args = ["--connect-timeout", "300s"]
+tool_timeout_sec = 360
+```
+
+`tool_timeout_sec` must exceed `--connect-timeout`; otherwise Codex cancels
+`open_colab_browser_connection` while the bridge is still waiting for the
+Colab tab to attach. The default of `60` is too short.
+
+`startup_timeout_sec` is usually not needed because the Go binary starts
+quickly. Add it only if your Codex client reports MCP server startup timeouts.
+
+### Generic stdio MCP clients (Claude Desktop, Cursor, Cline, etc.)
 
 ```json
 {
   "mcpServers": {
     "colab-mcp": {
       "command": "/absolute/path/to/colab-mcp-go",
-      "args": [],
-      "timeout": 30000
+      "args": ["--connect-timeout", "300s"]
     }
   }
 }
 ```
+
+If your client also exposes a per-tool or initialization timeout (often in
+milliseconds), set it above `--connect-timeout` — for example `360000` ms —
+so the open-connection call is not cancelled prematurely.
 
 ## CLI
 
