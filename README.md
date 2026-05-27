@@ -25,7 +25,8 @@ go install github.com/shinshin86/colab-mcp-go/cmd/colab-mcp-go@latest
 ```
 
 Requires Go 1.25+. The binary is placed in `$(go env GOPATH)/bin`. Make sure
-that directory is on `PATH`, or use the absolute path in the configs below.
+that directory is on `PATH`; if your MCP client cannot find the binary, use the
+absolute path instead.
 
 To build from a local checkout instead:
 
@@ -44,7 +45,7 @@ client-side timeout) to taste.
 
 ```sh
 claude mcp add colab-mcp -s user -- \
-  "$(go env GOPATH)/bin/colab-mcp-go" \
+  colab-mcp-go \
   --connect-timeout 300s
 ```
 
@@ -59,7 +60,7 @@ Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.colab-mcp]
-command = "/absolute/path/to/colab-mcp-go"
+command = "colab-mcp-go"
 args = ["--connect-timeout", "300s"]
 tool_timeout_sec = 360
 ```
@@ -77,7 +78,7 @@ quickly. Add it only if your Codex client reports MCP server startup timeouts.
 {
   "mcpServers": {
     "colab-mcp": {
-      "command": "/absolute/path/to/colab-mcp-go",
+      "command": "colab-mcp-go",
       "args": ["--connect-timeout", "300s"]
     }
   }
