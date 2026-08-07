@@ -98,6 +98,12 @@ func (m *Manager) RegisterInjectedTools() {
 			},
 		},
 	}, m.callColabTool)
+
+	m.server.AddTool(&mcp.Tool{
+		Name:        DisconnectToolName,
+		Description: "Disconnects and deletes the currently assigned Colab runtime (same as 'Runtime > Disconnect and delete runtime') by executing google.colab.runtime.unassign() in the kernel. Destructive: in-memory state and files outside mounted Drive are lost. The final step may report an error or timeout because the kernel terminates while executing it; treat that as likely success and verify in the Colab UI. Do not run additional cells to verify - that can assign a fresh runtime.",
+		InputSchema: emptyObjectSchema,
+	}, m.disconnectColabRuntime)
 }
 
 func (m *Manager) Run(ctx context.Context) {
@@ -380,7 +386,7 @@ func tokenKey(token any) string {
 }
 
 func isReservedTool(name string) bool {
-	return name == InjectedToolName || name == ListToolsName || name == CallToolName
+	return name == InjectedToolName || name == ListToolsName || name == CallToolName || name == DisconnectToolName
 }
 
 var Version = "v0.1.0"

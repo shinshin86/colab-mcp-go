@@ -113,6 +113,7 @@ Initially, the local MCP server exposes these bridge tools:
 - `open_colab_browser_connection`
 - `list_colab_tools`
 - `call_colab_tool`
+- `disconnect_colab_runtime`
 
 `open_colab_browser_connection` opens:
 
@@ -125,6 +126,19 @@ remote MCP client session over that WebSocket and dynamically registers the
 remote notebook tools on the local server. When the browser session disconnects,
 remote tools are removed and MCP clients receive
 `notifications/tools/list_changed`.
+
+`disconnect_colab_runtime` disconnects and deletes the currently assigned Colab
+runtime (the same effect as "Runtime > Disconnect and delete runtime") by
+executing `google.colab.runtime.unassign()` in the kernel via the notebook's
+cell tools. This stops compute-unit consumption for GPU runtimes. Notes:
+
+- Destructive: in-memory state and files outside mounted Drive are lost.
+- The final run step may report an error or timeout because the kernel
+  terminates while executing it; that usually means the disconnect succeeded.
+  Verify in the Colab UI, and do not run additional cells to check — running a
+  cell can assign a fresh runtime.
+- The browser tab and the bridge connection stay alive; only the runtime is
+  released. Reconnecting a runtime from the Colab UI resumes normal use.
 
 ## Development
 
