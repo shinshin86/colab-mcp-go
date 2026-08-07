@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -13,24 +14,58 @@ import (
 
 const DisconnectToolName = "disconnect_colab_runtime"
 
-const unassignMarker = "colab-mcp-go: disconnect_colab_runtime"
-
-// unassignCode is executed in the Colab kernel. runtime.unassign() is the
-// official API behind "Runtime > Disconnect and delete runtime".
-const unassignCode = "# " + unassignMarker + "\nfrom google.colab import runtime\nruntime.unassign()"
+// unassignMarkerPrefix tags the cell added by this tool; a per-call nonce is
+// appended so the newest disconnect cell is distinguishable from cells left
+// behind by earlier disconnects.
+const unassignMarkerPrefix = "colab-mcp-go: disconnect_colab_runtime"
 
 // unassignRunTimeout bounds the final run step: the kernel usually dies
 // mid-execution, so the call may never get a response.
 const unassignRunTimeout = 30 * time.Second
 
+// Outcomes reported in the structured result. "unknown" covers the expected
+// success shape (the kernel terminates while executing the cell, so the run
+// step errors or times out) and must be verified in the Colab UI.
+const (
+	outcomeCompleted = "completed"
+	outcomeUnknown   = "unknown"
+	outcomeFailed    = "failed"
+)
+
 var runToolNames = []string{"run_code_cell", "execute_cell"}
+
+var cellIDArgNames = []string{"cellId", "cell_id"}
 
 const (
 	addToolName = "add_code_cell"
 	getToolName = "get_cells"
 )
 
+// runtime.unassign() is the official API behind
+// "Runtime > Disconnect and delete runtime".
+func unassignCode(marker string) string {
+	return "# " + marker + "\nfrom google.colab import runtime\nruntime.unassign()"
+}
+
+// executionPlan is how the unassign snippet will be executed remotely: either
+// a runner that takes code directly, or add_code_cell followed by a runner
+// that takes a cell id.
+type executionPlan struct {
+	runTool   string
+	direct    bool
+	cellIDArg string
+	addTool   string
+	getTool   string
+}
+
 func (m *Manager) disconnectColabRuntime(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if !m.disconnecting.CompareAndSwap(false, true) {
+		var res mcp.CallToolResult
+		res.SetError(fmt.Errorf("another %s call is already in progress", DisconnectToolName))
+		return &res, nil
+	}
+	defer m.disconnecting.Store(false)
+
 	m.mu.RLock()
 	session := m.remoteSession
 	m.mu.RUnlock()
@@ -40,47 +75,56 @@ func (m *Manager) disconnectColabRuntime(ctx context.Context, _ *mcp.CallToolReq
 		return &res, nil
 	}
 
-	runTool, addTool, getTool, err := findExecutionTools(ctx, session)
+	plan, err := findExecutionPlan(ctx, session)
 	if err != nil {
 		var res mcp.CallToolResult
 		res.SetError(err)
 		return &res, nil
 	}
 
-	// Older Colab builds exposed an execution tool that takes code directly.
-	if schemaHasProperty(runTool.InputSchema, "code") {
-		return m.issueUnassign(ctx, session, runTool.Name, map[string]any{"code": unassignCode})
+	marker := fmt.Sprintf("%s %d", unassignMarkerPrefix, time.Now().UnixNano())
+	code := unassignCode(marker)
+
+	if plan.direct {
+		return m.issueUnassign(ctx, session, plan.runTool, map[string]any{"code": code})
 	}
 
-	// Current builds run existing cells by id: add a cell, then run it.
-	if addTool == nil {
-		var res mcp.CallToolResult
-		res.SetError(fmt.Errorf("remote tool %q runs cells by id but %q is not available; use %s manually", runTool.Name, addToolName, CallToolName))
-		return &res, nil
-	}
-	addRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: addTool.Name, Arguments: map[string]any{"code": unassignCode}})
+	addRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: plan.addTool, Arguments: map[string]any{"code": code}})
 	if err != nil {
 		var res mcp.CallToolResult
-		res.SetError(fmt.Errorf("%s failed: %w", addTool.Name, err))
+		res.SetError(fmt.Errorf("%s failed: %w", plan.addTool, err))
 		return &res, nil
 	}
 	if addRes.IsError {
 		return addRes, nil
 	}
 
-	cellID := findCellID(addRes)
-	if cellID == "" && getTool != nil {
-		if getRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: getTool.Name, Arguments: map[string]any{}}); err == nil && !getRes.IsError {
-			cellID = findMarkedCellID(getRes, unassignMarker)
+	// The marker lookup via get_cells is authoritative: it proves the id
+	// belongs to the cell this call just added. The id extracted from the
+	// add result is a fallback for notebooks where get_cells is missing or
+	// returns an unrecognized shape.
+	candidate, ambiguous := candidateCellID(addRes)
+	markedID := ""
+	if plan.getTool != "" {
+		if getRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: plan.getTool, Arguments: map[string]any{}}); err == nil && !getRes.IsError {
+			markedID = findMarkedCellID(getRes, marker)
 		}
+	}
+	cellID := markedID
+	if cellID == "" && !ambiguous {
+		cellID = candidate
 	}
 	if cellID == "" {
 		var res mcp.CallToolResult
-		res.SetError(fmt.Errorf("added the unassign cell but could not determine its cell id; run it manually via %s (%s)", CallToolName, runTool.Name))
+		reason := "could not determine the id of the added cell"
+		if ambiguous {
+			reason = "the add result contained multiple candidate cell ids"
+		}
+		res.SetError(fmt.Errorf("added the unassign cell but %s; run it manually via %s (%s)", reason, CallToolName, plan.runTool))
 		return &res, nil
 	}
 
-	return m.issueUnassign(ctx, session, runTool.Name, map[string]any{"cellId": cellID})
+	return m.issueUnassign(ctx, session, plan.runTool, map[string]any{plan.cellIDArg: cellID})
 }
 
 // issueUnassign runs the unassign cell. Because runtime.unassign() kills the
@@ -90,54 +134,76 @@ func (m *Manager) issueUnassign(ctx context.Context, session *mcp.ClientSession,
 	runCtx, cancel := context.WithTimeout(ctx, unassignRunTimeout)
 	defer cancel()
 
-	detail := ""
 	res, err := session.CallTool(runCtx, &mcp.CallToolParams{Name: toolName, Arguments: args})
+	var outcome, detail string
 	switch {
+	case err != nil && ctx.Err() != nil:
+		outcome = outcomeFailed
+		detail = fmt.Sprintf("%s was cancelled before completing (%v)", toolName, err)
+	case err != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded):
+		outcome = outcomeUnknown
+		detail = fmt.Sprintf("%s did not respond within %s; this is expected when the runtime terminates mid-execution", toolName, unassignRunTimeout)
 	case err != nil:
-		detail = fmt.Sprintf("%s got no response (%v); this is expected when the runtime terminates mid-execution", toolName, err)
+		outcome = outcomeUnknown
+		detail = fmt.Sprintf("%s got no response (%v); this can happen when the runtime terminates mid-execution", toolName, err)
 	case res.IsError:
-		detail = fmt.Sprintf("%s reported an error (%s); this can still mean the runtime terminated mid-execution", toolName, resultText(res))
+		outcome = outcomeUnknown
+		detail = fmt.Sprintf("%s reported an error (%s); this can mean the kernel died mid-execution, but check the message for a genuine failure such as a missing cell", toolName, resultText(res))
 	default:
+		outcome = outcomeCompleted
 		detail = fmt.Sprintf("%s completed", toolName)
 	}
 	detail += ". Verify in the Colab UI that the runtime is disconnected; do NOT run more cells to check - that can assign a fresh runtime."
-	m.logger.Info("issued runtime unassign", "tool", toolName, "detail", detail)
+	m.logger.Info("issued runtime unassign", "tool", toolName, "outcome", outcome, "detail", detail)
 	return &mcp.CallToolResult{
 		Content:           []mcp.Content{&mcp.TextContent{Text: detail}},
-		StructuredContent: map[string]any{"issued": true, "detail": detail},
+		StructuredContent: map[string]any{"issued": true, "outcome": outcome, "detail": detail},
 	}, nil
 }
 
-func findExecutionTools(ctx context.Context, session *mcp.ClientSession) (runTool, addTool, getTool *mcp.Tool, err error) {
+// findExecutionPlan picks the execution path by fixed priority (runToolNames
+// order), accepting a runner only when its input schema confirms the argument
+// it will be called with.
+func findExecutionPlan(ctx context.Context, session *mcp.ClientSession) (executionPlan, error) {
+	byName := map[string]*mcp.Tool{}
 	var names []string
 	for tool, iterErr := range session.Tools(ctx, nil) {
 		if iterErr != nil {
-			return nil, nil, nil, iterErr
+			return executionPlan{}, iterErr
 		}
 		if tool == nil {
 			continue
 		}
 		names = append(names, tool.Name)
-		switch {
-		case tool.Name == addToolName:
-			t := *tool
-			addTool = &t
-		case tool.Name == getToolName:
-			t := *tool
-			getTool = &t
-		default:
-			for _, name := range runToolNames {
-				if tool.Name == name && runTool == nil {
-					t := *tool
-					runTool = &t
-				}
+		t := *tool
+		byName[tool.Name] = &t
+	}
+
+	addOK := false
+	if t := byName[addToolName]; t != nil && schemaHasProperty(t.InputSchema, "code") {
+		addOK = true
+	}
+	getName := ""
+	if byName[getToolName] != nil {
+		getName = getToolName
+	}
+
+	for _, name := range runToolNames {
+		t := byName[name]
+		if t == nil {
+			continue
+		}
+		if schemaHasProperty(t.InputSchema, "code") {
+			return executionPlan{runTool: name, direct: true, getTool: getName}, nil
+		}
+		for _, arg := range cellIDArgNames {
+			if schemaHasProperty(t.InputSchema, arg) && addOK {
+				return executionPlan{runTool: name, cellIDArg: arg, addTool: addToolName, getTool: getName}, nil
 			}
 		}
 	}
-	if runTool == nil {
-		return nil, nil, nil, fmt.Errorf("no cell execution tool (%s) exposed by the Colab notebook; available: %s", strings.Join(runToolNames, ", "), strings.Join(names, ", "))
-	}
-	return runTool, addTool, getTool, nil
+	return executionPlan{}, fmt.Errorf("no usable cell execution plan: need one of [%s] taking code, or %s(code) plus a runner taking a cell id; available tools: %s",
+		strings.Join(runToolNames, ", "), addToolName, strings.Join(names, ", "))
 }
 
 func schemaHasProperty(schema any, name string) bool {
@@ -155,21 +221,19 @@ func schemaHasProperty(schema any, name string) bool {
 
 var cellIDTextPattern = regexp.MustCompile(`(?i)cell.{0,10}?id[^0-9A-Za-z_-]{1,4}([0-9A-Za-z_-]+)`)
 
-// findCellID extracts a cell id from a tool result, preferring explicit
-// cellId/cell_id keys over bare id keys, and falling back to a textual
-// "cell id: <value>" pattern for non-JSON results.
-func findCellID(res *mcp.CallToolResult) string {
-	var cellID, plainID string
+// candidateCellID extracts the id of the just-added cell from the add result.
+// Explicit cellId/cell_id keys win over bare id keys, which win over a
+// textual "cell id: <value>" pattern. If the preferred tier holds more than
+// one distinct value there is no way to tell which cell is ours, so the
+// result is reported as ambiguous rather than guessed at.
+func candidateCellID(res *mcp.CallToolResult) (id string, ambiguous bool) {
+	var explicit, bare, textual []string
 	record := func(key, val string) {
 		switch strings.ToLower(key) {
 		case "cellid", "cell_id":
-			if cellID == "" {
-				cellID = val
-			}
+			explicit = appendUnique(explicit, val)
 		case "id":
-			if plainID == "" {
-				plainID = val
-			}
+			bare = appendUnique(bare, val)
 		}
 	}
 	if res.StructuredContent != nil {
@@ -185,20 +249,27 @@ func findCellID(res *mcp.CallToolResult) string {
 			walkStrings(v, record)
 			continue
 		}
-		if cellID == "" {
-			if match := cellIDTextPattern.FindStringSubmatch(text.Text); match != nil {
-				cellID = match[1]
-			}
+		for _, match := range cellIDTextPattern.FindAllStringSubmatch(text.Text, -1) {
+			textual = appendUnique(textual, match[1])
 		}
 	}
-	if cellID != "" {
-		return cellID
+	for _, tier := range [][]string{explicit, bare, textual} {
+		if len(tier) == 1 {
+			return tier[0], false
+		}
+		if len(tier) > 1 {
+			return "", true
+		}
 	}
-	return plainID
+	return "", false
 }
 
-// findMarkedCellID looks for the object describing the cell whose source
-// contains marker (the cell added by this tool) and returns its id.
+// markerSourceKeys are the only fields the marker is searched in: the marker
+// is a code comment, so it can only legitimately appear in a cell's code.
+var markerSourceKeys = map[string]bool{"source": true, "code": true, "text": true, "content": true}
+
+// findMarkedCellID looks for the object describing the cell whose code
+// contains marker (the cell added by this call) and returns its id.
 func findMarkedCellID(res *mcp.CallToolResult, marker string) string {
 	var found string
 	var visit func(v any)
@@ -241,7 +312,10 @@ func findMarkedCellID(res *mcp.CallToolResult, marker string) string {
 }
 
 func containsMarker(obj map[string]any, marker string) bool {
-	for _, val := range obj {
+	for key, val := range obj {
+		if !markerSourceKeys[strings.ToLower(key)] {
+			continue
+		}
 		switch t := val.(type) {
 		case string:
 			if strings.Contains(t, marker) {
@@ -304,6 +378,18 @@ func toJSONValue(v any) any {
 		return nil
 	}
 	return out
+}
+
+func appendUnique(list []string, val string) []string {
+	if val == "" {
+		return list
+	}
+	for _, existing := range list {
+		if existing == val {
+			return list
+		}
+	}
+	return append(list, val)
 }
 
 func resultText(res *mcp.CallToolResult) string {

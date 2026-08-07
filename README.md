@@ -133,10 +133,14 @@ executing `google.colab.runtime.unassign()` in the kernel via the notebook's
 cell tools. This stops compute-unit consumption for GPU runtimes. Notes:
 
 - Destructive: in-memory state and files outside mounted Drive are lost.
-- The final run step may report an error or timeout because the kernel
-  terminates while executing it; that usually means the disconnect succeeded.
-  Verify in the Colab UI, and do not run additional cells to check — running a
-  cell can assign a fresh runtime.
+- The result reports `outcome: completed | unknown | failed`. The final run
+  step often reports an error or timeout because the kernel terminates while
+  executing it; that is reported as `unknown` and can still mean the
+  disconnect succeeded. Verify in the Colab UI, and do not run additional
+  cells to check — running a cell can assign a fresh runtime.
+- A marker comment cell is added to the notebook and remains afterwards as a
+  record of the disconnect. Re-running that cell later disconnects whatever
+  runtime is assigned at that time.
 - The browser tab and the bridge connection stay alive; only the runtime is
   released. Reconnecting a runtime from the Colab UI resumes normal use.
 
