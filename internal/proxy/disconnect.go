@@ -25,11 +25,11 @@ const unassignRunTimeout = 30 * time.Second
 
 // Outcomes reported in the structured result. "unknown" covers the expected
 // success shape (the kernel terminates while executing the cell, so the run
-// step errors or times out) and must be verified in the Colab UI.
+// step errors or times out) and must be verified in the Colab UI. Failures
+// before the cell is issued are reported as tool errors, not as an outcome.
 const (
 	outcomeCompleted = "completed"
 	outcomeUnknown   = "unknown"
-	outcomeFailed    = "failed"
 )
 
 var runToolNames = []string{"run_code_cell", "execute_cell"}
@@ -100,24 +100,29 @@ func (m *Manager) disconnectColabRuntime(ctx context.Context, _ *mcp.CallToolReq
 	}
 
 	// The marker lookup via get_cells is authoritative: it proves the id
-	// belongs to the cell this call just added. The id extracted from the
-	// add result is a fallback for notebooks where get_cells is missing or
-	// returns an unrecognized shape.
+	// belongs to the cell this call just added. When get_cells responds
+	// successfully, a marker match is required — an id from the add result,
+	// even a unique one, could be a request id or a stale cell id. The
+	// add-result id is only trusted when get_cells is missing or failed.
 	candidate, ambiguous := candidateCellID(addRes)
-	markedID := ""
+	cellID := ""
+	lookupSucceeded := false
 	if plan.getTool != "" {
 		if getRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: plan.getTool, Arguments: map[string]any{}}); err == nil && !getRes.IsError {
-			markedID = findMarkedCellID(getRes, marker)
+			lookupSucceeded = true
+			cellID = findMarkedCellID(getRes, marker)
 		}
 	}
-	cellID := markedID
-	if cellID == "" && !ambiguous {
+	if cellID == "" && !lookupSucceeded && !ambiguous {
 		cellID = candidate
 	}
 	if cellID == "" {
 		var res mcp.CallToolResult
 		reason := "could not determine the id of the added cell"
-		if ambiguous {
+		switch {
+		case lookupSucceeded:
+			reason = fmt.Sprintf("%s returned no cell containing this call's marker, so no id could be verified", plan.getTool)
+		case ambiguous:
 			reason = "the add result contained multiple candidate cell ids"
 		}
 		res.SetError(fmt.Errorf("added the unassign cell but %s; run it manually via %s (%s)", reason, CallToolName, plan.runTool))
@@ -130,7 +135,16 @@ func (m *Manager) disconnectColabRuntime(ctx context.Context, _ *mcp.CallToolReq
 // issueUnassign runs the unassign cell. Because runtime.unassign() kills the
 // kernel while the cell is executing, an error or timeout from this call is
 // the expected shape of success; only the Colab UI can confirm it visually.
+// Once the request has been dispatched there is no failure that proves the
+// cell did not execute, so every post-dispatch error maps to "unknown"; only
+// a context cancelled before dispatch is reported as a plain tool error.
 func (m *Manager) issueUnassign(ctx context.Context, session *mcp.ClientSession, toolName string, args map[string]any) (*mcp.CallToolResult, error) {
+	if ctx.Err() != nil {
+		var res mcp.CallToolResult
+		res.SetError(fmt.Errorf("cancelled before issuing %s: %w", toolName, ctx.Err()))
+		return &res, nil
+	}
+
 	runCtx, cancel := context.WithTimeout(ctx, unassignRunTimeout)
 	defer cancel()
 
@@ -138,8 +152,8 @@ func (m *Manager) issueUnassign(ctx context.Context, session *mcp.ClientSession,
 	var outcome, detail string
 	switch {
 	case err != nil && ctx.Err() != nil:
-		outcome = outcomeFailed
-		detail = fmt.Sprintf("%s was cancelled before completing (%v)", toolName, err)
+		outcome = outcomeUnknown
+		detail = fmt.Sprintf("%s was cancelled after the request was dispatched (%v); the runtime may already have been released", toolName, err)
 	case err != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		outcome = outcomeUnknown
 		detail = fmt.Sprintf("%s did not respond within %s; this is expected when the runtime terminates mid-execution", toolName, unassignRunTimeout)
@@ -180,7 +194,7 @@ func findExecutionPlan(ctx context.Context, session *mcp.ClientSession) (executi
 	}
 
 	addOK := false
-	if t := byName[addToolName]; t != nil && schemaHasProperty(t.InputSchema, "code") {
+	if t := byName[addToolName]; t != nil && schemaAccepts(t.InputSchema, "code") {
 		addOK = true
 	}
 	getName := ""
@@ -193,11 +207,11 @@ func findExecutionPlan(ctx context.Context, session *mcp.ClientSession) (executi
 		if t == nil {
 			continue
 		}
-		if schemaHasProperty(t.InputSchema, "code") {
+		if schemaAccepts(t.InputSchema, "code") {
 			return executionPlan{runTool: name, direct: true, getTool: getName}, nil
 		}
 		for _, arg := range cellIDArgNames {
-			if schemaHasProperty(t.InputSchema, arg) && addOK {
+			if schemaAccepts(t.InputSchema, arg) && addOK {
 				return executionPlan{runTool: name, cellIDArg: arg, addTool: addToolName, getTool: getName}, nil
 			}
 		}
@@ -206,7 +220,10 @@ func findExecutionPlan(ctx context.Context, session *mcp.ClientSession) (executi
 		strings.Join(runToolNames, ", "), addToolName, strings.Join(names, ", "))
 }
 
-func schemaHasProperty(schema any, name string) bool {
+// schemaAccepts reports whether a call passing exactly the provided argument
+// names can satisfy the schema: every provided name must exist in properties,
+// and every top-level required name must be among the provided ones.
+func schemaAccepts(schema any, provided ...string) bool {
 	obj, ok := toJSONValue(schema).(map[string]any)
 	if !ok {
 		return false
@@ -215,8 +232,25 @@ func schemaHasProperty(schema any, name string) bool {
 	if !ok {
 		return false
 	}
-	_, ok = props[name]
-	return ok
+	providedSet := map[string]bool{}
+	for _, name := range provided {
+		if _, ok := props[name]; !ok {
+			return false
+		}
+		providedSet[name] = true
+	}
+	if required, ok := obj["required"].([]any); ok {
+		for _, r := range required {
+			name, ok := r.(string)
+			if !ok {
+				continue
+			}
+			if !providedSet[name] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 var cellIDTextPattern = regexp.MustCompile(`(?i)cell.{0,10}?id[^0-9A-Za-z_-]{1,4}([0-9A-Za-z_-]+)`)

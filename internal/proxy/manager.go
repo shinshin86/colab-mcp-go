@@ -102,7 +102,7 @@ func (m *Manager) RegisterInjectedTools() {
 
 	m.server.AddTool(&mcp.Tool{
 		Name:        DisconnectToolName,
-		Description: "Disconnects and deletes the currently assigned Colab runtime (same as 'Runtime > Disconnect and delete runtime') by executing google.colab.runtime.unassign() in the kernel. Destructive: in-memory state and files outside mounted Drive are lost. The result reports outcome: 'completed', 'unknown' (the kernel terminated while executing the cell - the expected success shape - or a genuine failure; check the detail), or 'failed'. Verify in the Colab UI. Do not run additional cells to verify, and do not retry after a likely success - either can assign a fresh runtime.",
+		Description: "Disconnects and deletes the currently assigned Colab runtime (same as 'Runtime > Disconnect and delete runtime') by executing google.colab.runtime.unassign() in the kernel. Destructive: in-memory state and files outside mounted Drive are lost. The result reports outcome: 'completed', or 'unknown' (the kernel terminated while executing the cell - the expected success shape - or a genuine failure; check the detail). Failures before the cell is issued are reported as tool errors. Verify in the Colab UI. Do not run additional cells to verify, and do not retry after a likely success - either can assign a fresh runtime.",
 		InputSchema: emptyObjectSchema,
 	}, m.disconnectColabRuntime)
 }

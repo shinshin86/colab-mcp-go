@@ -427,3 +427,176 @@ func TestCandidateCellIDAmbiguousExplicit(t *testing.T) {
 		t.Fatalf("candidateCellID = %q ambiguous=%v, want ambiguous", id, ambiguous)
 	}
 }
+
+func TestDisconnectRuntimeUnverifiedIDRejectedWhenGetCellsSucceeds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+
+	remote.AddTool(&mcp.Tool{Name: "add_code_cell", InputSchema: cellSchema("code")}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{StructuredContent: map[string]any{"cellId": "stale-guess"}, Content: []mcp.Content{&mcp.TextContent{Text: "added"}}}, nil
+	})
+	remote.AddTool(&mcp.Tool{Name: "get_cells", InputSchema: map[string]any{"type": "object"}}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			StructuredContent: map[string]any{"cells": []any{map[string]any{"id": "other", "source": "print(1)"}}},
+			Content:           []mcp.Content{&mcp.TextContent{Text: "cells"}},
+		}, nil
+	})
+	runCalled := false
+	remote.AddTool(&mcp.Tool{Name: "run_code_cell", InputSchema: cellSchema("cellId")}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		runCalled = true
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+	})
+
+	res := callDisconnect(t, mgr)
+	if !res.IsError {
+		t.Fatalf("unverified id must be rejected when get_cells succeeds, got %#v", res)
+	}
+	if runCalled {
+		t.Fatal("must not run an id that get_cells could not verify")
+	}
+	if !contains(resultText(res), "marker") {
+		t.Fatalf("error should mention the marker: %s", resultText(res))
+	}
+}
+
+func TestDisconnectRuntimeGetCellsErrorFallsBackToCandidate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+
+	remote.AddTool(&mcp.Tool{Name: "add_code_cell", InputSchema: cellSchema("code")}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{StructuredContent: map[string]any{"cellId": "cell-7"}, Content: []mcp.Content{&mcp.TextContent{Text: "added"}}}, nil
+	})
+	remote.AddTool(&mcp.Tool{Name: "get_cells", InputSchema: map[string]any{"type": "object"}}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		res := &mcp.CallToolResult{}
+		res.SetError(errors.New("get_cells unavailable"))
+		return res, nil
+	})
+	var ranCellID string
+	remote.AddTool(&mcp.Tool{Name: "run_code_cell", InputSchema: cellSchema("cellId")}, func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ranCellID, _ = decodeArgs(t, req)["cellId"].(string)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+	})
+
+	res := callDisconnect(t, mgr)
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	if ranCellID != "cell-7" {
+		t.Fatalf("ran cell id = %q, want add-result fallback cell-7", ranCellID)
+	}
+}
+
+func TestDisconnectRuntimeRunnerWithExtraRequiredArgSkipped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+
+	runCodeCalled := false
+	remote.AddTool(&mcp.Tool{Name: "run_code_cell", InputSchema: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"cellId": map[string]any{"type": "string"},
+			"mode":   map[string]any{"type": "string"},
+		},
+		"required": []any{"cellId", "mode"},
+	}}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		runCodeCalled = true
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+	})
+	var ranCode string
+	remote.AddTool(&mcp.Tool{Name: "execute_cell", InputSchema: cellSchema("code")}, func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ranCode, _ = decodeArgs(t, req)["code"].(string)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+	})
+
+	res := callDisconnect(t, mgr)
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	if runCodeCalled {
+		t.Fatal("runner with unsatisfiable required args must be skipped")
+	}
+	if !contains(ranCode, "runtime.unassign()") {
+		t.Fatalf("ran code = %q, want unassign snippet", ranCode)
+	}
+}
+
+func TestIssueUnassignPreCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+
+	called := false
+	remote.AddTool(&mcp.Tool{Name: "run_code_cell", InputSchema: cellSchema("cellId")}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		called = true
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+	})
+
+	cancelledCtx, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	res, err := mgr.issueUnassign(cancelledCtx, mgr.remoteSession, "run_code_cell", map[string]any{"cellId": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatalf("pre-cancelled context must be a tool error, got %#v", res)
+	}
+	if called {
+		t.Fatal("must not dispatch after the context was cancelled")
+	}
+}
+
+func TestDisconnectRuntimeCancelAfterDispatchIsUnknown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	remote.AddTool(&mcp.Tool{Name: "execute_cell", InputSchema: cellSchema("code")}, func(handlerCtx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		close(started)
+		select {
+		case <-handlerCtx.Done():
+		case <-release:
+		}
+		return nil, handlerCtx.Err()
+	})
+
+	callCtx, callCancel := context.WithCancel(context.Background())
+	defer callCancel()
+	done := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, err := mgr.disconnectColabRuntime(callCtx, &mcp.CallToolRequest{
+			Params: &mcp.CallToolParamsRaw{Name: DisconnectToolName},
+		})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- res
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("execute_cell was not dispatched")
+	}
+	callCancel()
+
+	select {
+	case res := <-done:
+		if res == nil {
+			t.Fatal("no result")
+		}
+		if res.IsError {
+			t.Fatalf("post-dispatch cancel must not be a tool error: %s", resultText(res))
+		}
+		if outcome := disconnectOutcome(t, res); outcome != outcomeUnknown {
+			t.Fatalf("outcome = %q, want %q", outcome, outcomeUnknown)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("disconnect did not return after cancellation")
+	}
+}
