@@ -51,11 +51,13 @@ func unassignCode(marker string) string {
 // a runner that takes code directly, or add_code_cell followed by a runner
 // that takes a cell id.
 type executionPlan struct {
-	runTool   string
-	direct    bool
-	cellIDArg string
-	addTool   string
-	getTool   string
+	runTool         string
+	direct          bool
+	cellIDArg       string
+	addTool         string
+	getTool         string
+	addCellIndexArg bool
+	addLanguageArg  bool
 }
 
 func (m *Manager) disconnectColabRuntime(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -89,7 +91,21 @@ func (m *Manager) disconnectColabRuntime(ctx context.Context, _ *mcp.CallToolReq
 		return m.issueUnassign(ctx, session, plan.runTool, map[string]any{"code": code})
 	}
 
-	addRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: plan.addTool, Arguments: map[string]any{"code": code}})
+	addArgs := map[string]any{"code": code}
+	if plan.addCellIndexArg {
+		cellIndex, err := currentCellCount(ctx, session, plan.getTool)
+		if err != nil {
+			var res mcp.CallToolResult
+			res.SetError(err)
+			return &res, nil
+		}
+		addArgs["cellIndex"] = cellIndex
+	}
+	if plan.addLanguageArg {
+		addArgs["language"] = "python"
+	}
+
+	addRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: plan.addTool, Arguments: addArgs})
 	if err != nil {
 		var res mcp.CallToolResult
 		res.SetError(fmt.Errorf("%s failed: %w", plan.addTool, err))
@@ -193,14 +209,11 @@ func findExecutionPlan(ctx context.Context, session *mcp.ClientSession) (executi
 		byName[tool.Name] = &t
 	}
 
-	addOK := false
-	if t := byName[addToolName]; t != nil && schemaAccepts(t.InputSchema, "code") {
-		addOK = true
-	}
 	getName := ""
-	if byName[getToolName] != nil {
+	if t := byName[getToolName]; t != nil && schemaAccepts(t.InputSchema) {
 		getName = getToolName
 	}
+	addPlan, addOK := findAddCellPlan(byName[addToolName], getName)
 
 	for _, name := range runToolNames {
 		t := byName[name]
@@ -212,12 +225,49 @@ func findExecutionPlan(ctx context.Context, session *mcp.ClientSession) (executi
 		}
 		for _, arg := range cellIDArgNames {
 			if schemaAccepts(t.InputSchema, arg) && addOK {
-				return executionPlan{runTool: name, cellIDArg: arg, addTool: addToolName, getTool: getName}, nil
+				addPlan.runTool = name
+				addPlan.cellIDArg = arg
+				return addPlan, nil
 			}
 		}
 	}
-	return executionPlan{}, fmt.Errorf("no usable cell execution plan: need one of [%s] taking code, or %s(code) plus a runner taking a cell id; available tools: %s",
+	return executionPlan{}, fmt.Errorf("no usable cell execution plan: need one of [%s] taking code, or %s with supported arguments plus a runner taking a cell id; available tools: %s",
 		strings.Join(runToolNames, ", "), addToolName, strings.Join(names, ", "))
+}
+
+// findAddCellPlan accepts the legacy code-only schema and the current Colab
+// schema, which additionally requires cellIndex and language. Only argument
+// sets whose required fields are fully known are considered, preserving the
+// planner's fail-closed behavior when Colab exposes a new required field.
+func findAddCellPlan(tool *mcp.Tool, getName string) (executionPlan, bool) {
+	if tool == nil {
+		return executionPlan{}, false
+	}
+	variants := []struct {
+		provided  []string
+		cellIndex bool
+		language  bool
+	}{
+		{provided: []string{"code"}},
+		{provided: []string{"code", "language"}, language: true},
+		{provided: []string{"code", "cellIndex"}, cellIndex: true},
+		{provided: []string{"code", "cellIndex", "language"}, cellIndex: true, language: true},
+	}
+	for _, variant := range variants {
+		if !schemaAccepts(tool.InputSchema, variant.provided...) {
+			continue
+		}
+		if variant.cellIndex && getName == "" {
+			continue
+		}
+		return executionPlan{
+			addTool:         addToolName,
+			getTool:         getName,
+			addCellIndexArg: variant.cellIndex,
+			addLanguageArg:  variant.language,
+		}, true
+	}
+	return executionPlan{}, false
 }
 
 // schemaAccepts reports whether a call passing exactly the provided argument
@@ -228,9 +278,12 @@ func schemaAccepts(schema any, provided ...string) bool {
 	if !ok {
 		return false
 	}
-	props, ok := obj["properties"].(map[string]any)
-	if !ok {
-		return false
+	props := map[string]any{}
+	if rawProps, exists := obj["properties"]; exists {
+		props, ok = rawProps.(map[string]any)
+		if !ok {
+			return false
+		}
 	}
 	providedSet := map[string]bool{}
 	for _, name := range provided {
@@ -239,18 +292,111 @@ func schemaAccepts(schema any, provided ...string) bool {
 		}
 		providedSet[name] = true
 	}
-	if required, ok := obj["required"].([]any); ok {
-		for _, r := range required {
-			name, ok := r.(string)
-			if !ok {
-				continue
-			}
+	if rawRequired, exists := obj["required"]; exists {
+		required, ok := stringList(rawRequired)
+		if !ok {
+			return false
+		}
+		for _, name := range required {
 			if !providedSet[name] {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func stringList(v any) ([]string, bool) {
+	switch list := v.(type) {
+	case []string:
+		return list, true
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, s)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// currentCellCount obtains the insertion index for appending a cell. It must
+// succeed before add_code_cell is called: guessing an index could modify the
+// notebook at an unintended location.
+func currentCellCount(ctx context.Context, session *mcp.ClientSession, toolName string) (int, error) {
+	if toolName == "" {
+		return 0, fmt.Errorf("%s requires cellIndex, but no zero-argument %s tool is available", addToolName, getToolName)
+	}
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: toolName, Arguments: map[string]any{}})
+	if err != nil {
+		return 0, fmt.Errorf("%s failed before adding the unassign cell: %w", toolName, err)
+	}
+	if res == nil {
+		return 0, fmt.Errorf("%s returned no result before adding the unassign cell", toolName)
+	}
+	if res.IsError {
+		return 0, fmt.Errorf("%s failed before adding the unassign cell: %s", toolName, resultText(res))
+	}
+	if count, ok := cellCount(res); ok {
+		return count, nil
+	}
+	return 0, fmt.Errorf("%s returned no recognizable cells array, so %s was not called", toolName, addToolName)
+}
+
+// cellCount reads the cells array from structured content or JSON text. A
+// top-level array is also accepted because Colab-side result envelopes have
+// varied between builds.
+func cellCount(res *mcp.CallToolResult) (int, bool) {
+	if res == nil {
+		return 0, false
+	}
+	if res.StructuredContent != nil {
+		if count, ok := cellCountValue(toJSONValue(res.StructuredContent), true); ok {
+			return count, true
+		}
+	}
+	for _, c := range res.Content {
+		text, ok := c.(*mcp.TextContent)
+		if !ok {
+			continue
+		}
+		var value any
+		if json.Unmarshal([]byte(text.Text), &value) == nil {
+			if count, ok := cellCountValue(value, true); ok {
+				return count, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func cellCountValue(v any, topLevel bool) (int, bool) {
+	switch value := v.(type) {
+	case []any:
+		if topLevel {
+			return len(value), true
+		}
+	case map[string]any:
+		for key, item := range value {
+			if strings.EqualFold(key, "cells") {
+				if cells, ok := item.([]any); ok {
+					return len(cells), true
+				}
+				return 0, false
+			}
+		}
+		for _, item := range value {
+			if count, ok := cellCountValue(item, false); ok {
+				return count, true
+			}
+		}
+	}
+	return 0, false
 }
 
 var cellIDTextPattern = regexp.MustCompile(`(?i)cell.{0,10}?id[^0-9A-Za-z_-]{1,4}([0-9A-Za-z_-]+)`)

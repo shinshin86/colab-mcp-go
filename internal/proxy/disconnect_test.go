@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -39,6 +40,21 @@ func cellSchema(props ...string) map[string]any {
 		properties[p] = map[string]any{"type": "string"}
 	}
 	return map[string]any{"type": "object", "properties": properties}
+}
+
+// observedColabToolSchemas loads the exact input schemas captured from a live
+// Colab MCP session so future schema drift breaks this regression test.
+func observedColabToolSchemas(t *testing.T) map[string]map[string]any {
+	t.Helper()
+	data, err := os.ReadFile("testdata/colab_tool_schemas.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schemas map[string]map[string]any
+	if err := json.Unmarshal(data, &schemas); err != nil {
+		t.Fatal(err)
+	}
+	return schemas
 }
 
 func decodeArgs(t *testing.T, req *mcp.CallToolRequest) map[string]any {
@@ -134,6 +150,117 @@ func TestDisconnectRuntimeAddsAndRunsCell(t *testing.T) {
 	}
 	if outcome := disconnectOutcome(t, res); outcome != outcomeCompleted {
 		t.Fatalf("outcome = %q, want %q", outcome, outcomeCompleted)
+	}
+}
+
+func TestDisconnectRuntimeObservedColabSchemas(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+	schemas := observedColabToolSchemas(t)
+
+	var addedCode string
+	var addArgs map[string]any
+	remote.AddTool(&mcp.Tool{Name: "add_code_cell", InputSchema: schemas["add_code_cell"]}, func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		addArgs = decodeArgs(t, req)
+		addedCode, _ = addArgs["code"].(string)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "cell added"}}}, nil
+	})
+
+	getCalls := 0
+	remote.AddTool(&mcp.Tool{Name: "get_cells", InputSchema: schemas["get_cells"]}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		getCalls++
+		cells := []any{
+			map[string]any{"id": "cell-1", "source": "print(1)"},
+			map[string]any{"id": "cell-2", "source": "print(2)"},
+		}
+		if getCalls > 1 {
+			cells = append(cells, map[string]any{"id": "disconnect-cell", "source": addedCode})
+		}
+		encoded, err := json.Marshal(cells)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(encoded)}},
+		}, nil
+	})
+
+	var ranCellID string
+	remote.AddTool(&mcp.Tool{Name: "run_code_cell", InputSchema: schemas["run_code_cell"]}, func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ranCellID, _ = decodeArgs(t, req)["cellId"].(string)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+	})
+
+	res := callDisconnect(t, mgr)
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	if addArgs["cellIndex"] != float64(2) {
+		t.Fatalf("add args = %#v, want cellIndex 2", addArgs)
+	}
+	if addArgs["language"] != "python" {
+		t.Fatalf("add args = %#v, want language python", addArgs)
+	}
+	if !contains(addedCode, "runtime.unassign()") || !contains(addedCode, unassignMarkerPrefix) {
+		t.Fatalf("added code = %q, want marked unassign snippet", addedCode)
+	}
+	if getCalls != 2 {
+		t.Fatalf("get_cells calls = %d, want 2 (append index and marker verification)", getCalls)
+	}
+	if ranCellID != "disconnect-cell" {
+		t.Fatalf("ran cell id = %q, want disconnect-cell", ranCellID)
+	}
+}
+
+func TestDisconnectRuntimeCellIndexSchemaRequiresGetCells(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+	schemas := observedColabToolSchemas(t)
+
+	addCalled := false
+	remote.AddTool(&mcp.Tool{Name: "add_code_cell", InputSchema: schemas["add_code_cell"]}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		addCalled = true
+		return &mcp.CallToolResult{}, nil
+	})
+	remote.AddTool(&mcp.Tool{Name: "run_code_cell", InputSchema: schemas["run_code_cell"]}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{}, nil
+	})
+
+	res := callDisconnect(t, mgr)
+	if !res.IsError || !contains(resultText(res), "no usable cell execution plan") {
+		t.Fatalf("expected no-plan error, got %#v", res)
+	}
+	if addCalled {
+		t.Fatal("must not add a cell when its insertion index cannot be obtained")
+	}
+}
+
+func TestDisconnectRuntimeUnrecognizedCellsResultStopsBeforeAdd(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, remote := newDisconnectTestManager(t, ctx)
+	schemas := observedColabToolSchemas(t)
+
+	addCalled := false
+	remote.AddTool(&mcp.Tool{Name: "add_code_cell", InputSchema: schemas["add_code_cell"]}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		addCalled = true
+		return &mcp.CallToolResult{}, nil
+	})
+	remote.AddTool(&mcp.Tool{Name: "get_cells", InputSchema: schemas["get_cells"]}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "cells unavailable"}}}, nil
+	})
+	remote.AddTool(&mcp.Tool{Name: "run_code_cell", InputSchema: schemas["run_code_cell"]}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{}, nil
+	})
+
+	res := callDisconnect(t, mgr)
+	if !res.IsError || !contains(resultText(res), "no recognizable cells array") {
+		t.Fatalf("expected cell-count error, got %#v", res)
+	}
+	if addCalled {
+		t.Fatal("must not add a cell when get_cells cannot provide an insertion index")
 	}
 }
 

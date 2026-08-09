@@ -1,0 +1,71 @@
+{
+  "add_code_cell": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "cellIndex": {
+        "description": "The index at which to insert the cell.",
+        "maximum": 9007199254740991,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "code": {
+        "description": "The code content of the new cell.",
+        "type": "string"
+      },
+      "language": {
+        "description": "The programming language of the new cell.",
+        "enum": [
+          "python",
+          "r",
+          "julia"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "cellIndex",
+      "language",
+      "code"
+    ],
+    "type": "object"
+  },
+  "get_cells": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "cellIndexEnd": {
+        "description": "The end index for the cell range (inclusive). This must be greater than or equal to cellIndexStart. If not provided, this defaults to the last available cell index.",
+        "maximum": 9007199254740991,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "cellIndexStart": {
+        "description": "The starting index for the cell range (inclusive). If not provided, this defaults to 0.",
+        "maximum": 9007199254740991,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "includeOutputs": {
+        "default": false,
+        "description": "Whether to include the code cell execution outputs in the response. If not provided, this defaults to false.",
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "run_code_cell": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "cellId": {
+        "description": "The ID of the code cell to execute.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "cellId"
+    ],
+    "type": "object"
+  }
+}
