@@ -77,8 +77,17 @@ func NewManager(server *mcp.Server, ws *colabws.Server, opener browser.Opener, t
 func (m *Manager) RegisterInjectedTools() {
 	m.server.AddTool(&mcp.Tool{
 		Name:        InjectedToolName,
-		Description: "Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Returns a boolean representing whether the connection attempt succeeded",
-		InputSchema: emptyObjectSchema,
+		Description: "Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Pass notebook_url to reconnect an existing notebook. Returns a boolean representing whether the connection attempt succeeded",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"notebook_url": map[string]any{
+					"type":        "string",
+					"format":      "uri",
+					"description": "Optional existing Google Colab notebook URL to open instead of a blank notebook",
+				},
+			},
+		},
 	}, m.openColabBrowserConnection)
 
 	m.server.AddTool(&mcp.Tool{

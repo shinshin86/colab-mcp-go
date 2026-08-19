@@ -39,8 +39,20 @@ func (a *App) Run(ctx context.Context) error {
 	var ws *colabws.Server
 	var mgr *proxy.Manager
 	if a.Config.EnableProxy {
+		token := ""
+		if a.Config.TokenFile != "" {
+			var err error
+			token, err = colabws.LoadOrCreateToken(a.Config.TokenFile)
+			if err != nil {
+				return fmt.Errorf("load browser connection token: %w", err)
+			}
+		}
 		var err error
-		ws, err = colabws.New(a.Config.Host, a.Logger)
+		ws, err = colabws.NewWithOptions(colabws.Options{
+			Host:  a.Config.Host,
+			Port:  a.Config.Port,
+			Token: token,
+		}, a.Logger)
 		if err != nil {
 			return err
 		}
@@ -66,8 +78,8 @@ type loggingNoopOpener struct {
 	logger *slog.Logger
 }
 
-func (o loggingNoopOpener) Open(_ context.Context, url string) error {
-	o.logger.Info("not opening browser because --no-browser is set", "url", url)
+func (o loggingNoopOpener) Open(_ context.Context, _ string) error {
+	o.logger.Info("not opening browser because --no-browser is set")
 	return nil
 }
 

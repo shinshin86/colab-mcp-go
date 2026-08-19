@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -48,6 +49,59 @@ func TestOpenToolDisconnectedOpensURLAndTimesOut(t *testing.T) {
 	}
 }
 
+func TestOpenToolUsesExistingNotebookURL(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := startWS(t, ctx)
+	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	opener := &fakeOpener{}
+	mgr := NewManager(local, ws, opener, 10*time.Millisecond, nil)
+
+	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{
+			Name:      InjectedToolName,
+			Arguments: json.RawMessage(`{"notebook_url":"https://colab.research.google.com/drive/example-notebook#scrollTo=cell"}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("open returned an error: %#v", res.Content)
+	}
+	if len(opener.urls) != 1 || !contains(opener.urls[0], "colab.research.google.com/drive/example-notebook#") {
+		t.Fatalf("opened URLs = %#v", opener.urls)
+	}
+	if contains(opener.urls[0], "scrollTo=cell") {
+		t.Fatalf("stale URL fragment was retained: %s", opener.urls[0])
+	}
+}
+
+func TestOpenToolRejectsNonColabNotebookURL(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := startWS(t, ctx)
+	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	opener := &fakeOpener{}
+	mgr := NewManager(local, ws, opener, 10*time.Millisecond, nil)
+
+	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{
+			Name:      InjectedToolName,
+			Arguments: json.RawMessage(`{"notebook_url":"https://example.com/notebook.ipynb"}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("non-Colab URL unexpectedly accepted")
+	}
+	if len(opener.urls) != 0 {
+		t.Fatalf("opener was called for an invalid URL: %#v", opener.urls)
+	}
+}
+
 func TestOpenToolAlreadyConnectedDoesNotOpenBrowser(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -69,6 +123,33 @@ func TestOpenToolAlreadyConnectedDoesNotOpenBrowser(t *testing.T) {
 	}
 	if res.StructuredContent.(map[string]any)["result"] != true {
 		t.Fatalf("result = %#v, want true", res.StructuredContent)
+	}
+}
+
+func TestOpenToolDoesNotSwitchAnActiveBrowserConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := startWS(t, ctx)
+	keepWSLive(t, ws)
+	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	opener := &fakeOpener{}
+	mgr := NewManager(local, ws, opener, time.Second, nil)
+	mgr.setRemoteSession(startRemoteMCP(t, ctx))
+
+	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{
+			Name:      InjectedToolName,
+			Arguments: json.RawMessage(`{"notebook_url":"https://colab.research.google.com/drive/example-notebook"}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("active browser connection was silently replaced")
+	}
+	if len(opener.urls) != 0 {
+		t.Fatalf("opener was called while a browser was connected: %#v", opener.urls)
 	}
 }
 

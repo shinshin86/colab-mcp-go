@@ -3,8 +3,11 @@ package colabws
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +103,95 @@ func TestTokenInURL(t *testing.T) {
 	defer c.Close()
 	if !s.Live() {
 		t.Fatal("connection should be live")
+	}
+}
+
+func TestConfiguredPortAndToken(t *testing.T) {
+	probe, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	_ = probe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	const token = "configured_token_1234567890"
+	s, err := NewWithOptions(Options{Host: "localhost", Port: port, Token: token}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if s.Port() != port {
+		t.Fatalf("port = %d, want %d", s.Port(), port)
+	}
+	if s.Token() != token {
+		t.Fatal("server did not use the configured token")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	restartCtx, restartCancel := context.WithCancel(context.Background())
+	defer restartCancel()
+	restarted, err := NewWithOptions(Options{Host: "localhost", Port: port, Token: token}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Start(restartCtx); err != nil {
+		t.Fatalf("restart on stable port failed: %v", err)
+	}
+	defer restarted.Close()
+	if restarted.Port() != port || restarted.Token() != token {
+		t.Fatal("port or token changed after restart")
+	}
+}
+
+func TestBrowserURL(t *testing.T) {
+	s, _ := startTestServer(t)
+	tests := []struct {
+		name       string
+		notebook   string
+		wantPrefix string
+		wantErr    bool
+	}{
+		{"scratch", "", ColabBaseURL + ScratchPath, false},
+		{"existing notebook", ColabBaseURL + "/drive/example-notebook#scrollTo=cell", ColabBaseURL + "/drive/example-notebook", false},
+		{"alternative host", ColabAlternativeURL + "/github/example/repo/blob/main/demo.ipynb", ColabAlternativeURL + "/github/example/repo/blob/main/demo.ipynb", false},
+		{"non Colab host", "https://example.com/notebook.ipynb", "", true},
+		{"non HTTPS URL", "http://colab.research.google.com/drive/example", "", true},
+		{"URL with credentials", "https://@colab.research.google.com/drive/example", "", true},
+		{"URL with port", "https://colab.research.google.com:443/drive/example", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := s.BrowserURL(tt.notebook)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("BrowserURL(%q) unexpectedly succeeded: %s", tt.notebook, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(got, tt.wantPrefix) {
+				t.Fatalf("URL = %q, want prefix %q", got, tt.wantPrefix)
+			}
+			u, err := url.Parse(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fragment, err := url.ParseQuery(u.Fragment)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fragment.Get("mcpProxyToken") != s.Token() || fragment.Get("mcpProxyPort") != strconv.Itoa(s.Port()) {
+				t.Fatalf("connection fragment = %q", u.Fragment)
+			}
+		})
 	}
 }
 
