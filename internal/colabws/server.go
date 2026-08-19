@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +26,9 @@ type Server struct {
 	Host   string
 	Logger *slog.Logger
 
-	token string
-	port  int
+	token    string
+	port     int
+	bindPort int
 
 	httpServer *http.Server
 	listener   net.Listener
@@ -39,21 +42,41 @@ type Server struct {
 	closeOnce sync.Once
 }
 
+type Options struct {
+	Host  string
+	Port  int
+	Token string
+}
+
 func New(host string, logger *slog.Logger) (*Server, error) {
-	if host == "" {
-		host = "localhost"
+	return NewWithOptions(Options{Host: host}, logger)
+}
+
+func NewWithOptions(options Options, logger *slog.Logger) (*Server, error) {
+	if options.Host == "" {
+		options.Host = "localhost"
+	}
+	if options.Port < 0 || options.Port > 65535 {
+		return nil, fmt.Errorf("port must be between 0 and 65535")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	token, err := newToken()
-	if err != nil {
+	token := options.Token
+	if token == "" {
+		var err error
+		token, err = newToken()
+		if err != nil {
+			return nil, err
+		}
+	} else if err := validateToken(token); err != nil {
 		return nil, err
 	}
 	s := &Server{
-		Host:     host,
+		Host:     options.Host,
 		Logger:   logger,
 		token:    token,
+		bindPort: options.Port,
 		accepted: make(chan *Connection, 1),
 	}
 	s.upgrader = websocket.Upgrader{
@@ -64,7 +87,7 @@ func New(host string, logger *slog.Logger) (*Server, error) {
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	ln, err := net.Listen("tcp", net.JoinHostPort(s.Host, "0"))
+	ln, err := net.Listen("tcp", net.JoinHostPort(s.Host, strconv.Itoa(s.bindPort)))
 	if err != nil {
 		return err
 	}
@@ -136,8 +159,21 @@ func (s *Server) OnDisconnect(fn func()) {
 	s.onDisc = append(s.onDisc, fn)
 }
 
-func (s *Server) BrowserURL() string {
-	return fmt.Sprintf("%s%s#mcpProxyToken=%s&mcpProxyPort=%d", ColabBaseURL, ScratchPath, s.token, s.port)
+func (s *Server) BrowserURL(notebookURL string) (string, error) {
+	target := strings.TrimSpace(notebookURL)
+	if target == "" {
+		target = ColabBaseURL + ScratchPath
+	}
+	u, err := url.Parse(target)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" || !isAllowedColabHost(u.Hostname()) {
+		return "", fmt.Errorf("notebook_url must be an HTTPS URL on colab.research.google.com or colab.google.com")
+	}
+	fragment := url.Values{}
+	fragment.Set("mcpProxyToken", s.token)
+	fragment.Set("mcpProxyPort", strconv.Itoa(s.port))
+	u.Fragment = fragment.Encode()
+	u.RawFragment = ""
+	return u.String(), nil
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -219,6 +255,10 @@ func isAllowedOrigin(origin string) bool {
 	return origin == ColabBaseURL || origin == ColabAlternativeURL
 }
 
+func isAllowedColabHost(host string) bool {
+	return strings.EqualFold(host, "colab.research.google.com") || strings.EqualFold(host, "colab.google.com")
+}
+
 func hasMCPSubprotocol(values []string) bool {
 	for _, v := range values {
 		for _, part := range strings.Split(v, ",") {
@@ -236,4 +276,17 @@ func newToken() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+func validateToken(token string) error {
+	if len(token) < 22 {
+		return fmt.Errorf("browser connection token must contain at least 22 URL-safe characters")
+	}
+	for _, r := range token {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return fmt.Errorf("browser connection token must contain only URL-safe letters, digits, '-' or '_'")
+	}
+	return nil
 }

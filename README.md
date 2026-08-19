@@ -41,11 +41,29 @@ your browser. The examples below give it up to five minutes, which is usually
 enough for a fresh Google sign-in. Tune `--connect-timeout` (and the matching
 client-side timeout) to taste.
 
+By default, each server start uses an ephemeral WebSocket port and a new
+connection token. To reconnect the same browser tab after an MCP client or
+server restart, configure both a stable port and a persistent token file:
+
+```sh
+colab-mcp-go \
+  --port 8765 \
+  --token-file ~/.config/colab-mcp-go/connection-token \
+  --connect-timeout 300s
+```
+
+The token file is created with owner-only permissions and its value is never
+written to the server log. Use a different port and token file for each MCP
+client that may run concurrently. Do not commit or share the token file; to
+rotate it, stop the bridge and delete the file before the next start.
+
 ### Claude Code
 
 ```sh
 claude mcp add colab-mcp -s user -- \
   colab-mcp-go \
+  --port 8765 \
+  --token-file ~/.config/colab-mcp-go/connection-token \
   --connect-timeout 300s
 ```
 
@@ -61,7 +79,11 @@ Add to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.colab-mcp]
 command = "colab-mcp-go"
-args = ["--connect-timeout", "300s"]
+args = [
+  "--port", "8765",
+  "--token-file", "~/.config/colab-mcp-go/connection-token",
+  "--connect-timeout", "300s",
+]
 tool_timeout_sec = 360
 ```
 
@@ -79,7 +101,11 @@ quickly. Add it only if your Codex client reports MCP server startup timeouts.
   "mcpServers": {
     "colab-mcp": {
       "command": "colab-mcp-go",
-      "args": ["--connect-timeout", "300s"]
+      "args": [
+        "--port", "8765",
+        "--token-file", "~/.config/colab-mcp-go/connection-token",
+        "--connect-timeout", "300s"
+      ]
     }
   }
 }
@@ -100,6 +126,12 @@ Flags:
 - `--log <dir>`: write log files to this directory. If unset, a temporary
   `colab-mcp-go-logs-*` directory is created.
 - `--host <host>`: WebSocket bind host. Default: `localhost`.
+- `--port <port>`: WebSocket bind port. Default: `0`, which chooses an
+  ephemeral port. Set a stable port together with `--token-file` to reconnect
+  after a server restart.
+- `--token-file <path>`: read or create a persistent URL-safe connection token.
+  New files use owner-only permissions. `~` is expanded to the current user's
+  home directory.
 - `--connect-timeout <duration>`: how long
   `open_colab_browser_connection` waits for the Colab UI. Default: `60s`.
 - `--no-browser`: do not open the browser, useful for tests and headless runs.
@@ -115,11 +147,32 @@ Initially, the local MCP server exposes these bridge tools:
 - `call_colab_tool`
 - `disconnect_colab_runtime`
 
-`open_colab_browser_connection` opens:
+With no arguments, `open_colab_browser_connection` opens:
 
 ```text
 https://colab.research.google.com/notebooks/empty.ipynb#mcpProxyToken=<token>&mcpProxyPort=<port>
 ```
+
+To connect an existing notebook instead, pass its URL:
+
+```json
+{
+  "notebook_url": "https://colab.research.google.com/drive/<notebook-id>"
+}
+```
+
+Only HTTPS URLs on `colab.research.google.com` and `colab.google.com` are
+accepted. The bridge replaces any existing URL fragment with its connection
+parameters. With a stable `--port` and `--token-file`, the same notebook URL can
+be opened again after a server restart; reload the notebook tab if it does not
+reconnect automatically.
+
+The bridge accepts one browser connection at a time. Close the current Colab
+browser connection before using `notebook_url` to switch to another notebook.
+
+If the configured port is already in use, another bridge process may still be
+running. Stop that process or select a different port before restarting this
+server.
 
 After the Colab browser session connects over WebSocket, the bridge initializes a
 remote MCP client session over that WebSocket and dynamically registers the

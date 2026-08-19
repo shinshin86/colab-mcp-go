@@ -7,6 +7,8 @@ const Version = "v0.1.0"
 type Config struct {
 	LogDir         string
 	Host           string
+	Port           int
+	TokenFile      string
 	ConnectTimeout time.Duration
 	NoBrowser      bool
 	EnableProxy    bool

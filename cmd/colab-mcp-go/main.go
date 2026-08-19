@@ -18,6 +18,8 @@ func main() {
 	var showVersion bool
 	flag.StringVar(&cfg.LogDir, "log", "", "log file directory")
 	flag.StringVar(&cfg.Host, "host", "localhost", "WebSocket bind host")
+	flag.IntVar(&cfg.Port, "port", 0, "WebSocket bind port (0 chooses an ephemeral port)")
+	flag.StringVar(&cfg.TokenFile, "token-file", "", "persist the browser connection token in this file")
 	flag.DurationVar(&cfg.ConnectTimeout, "connect-timeout", 60*time.Second, "Colab UI connection timeout")
 	flag.BoolVar(&cfg.NoBrowser, "no-browser", false, "do not open a browser when the connection tool is called")
 	flag.BoolVar(&cfg.EnableProxy, "enable-proxy", true, "enable the Colab browser session proxy")

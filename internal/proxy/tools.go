@@ -8,12 +8,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func (m *Manager) openColabBrowserConnection(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var in struct {
+		NotebookURL string `json:"notebook_url"`
+	}
+	if len(req.Params.Arguments) > 0 {
+		if err := json.Unmarshal(req.Params.Arguments, &in); err != nil {
+			var res mcp.CallToolResult
+			res.SetError(err)
+			return &res, nil
+		}
+	}
 	if m.IsConnected() {
+		if strings.TrimSpace(in.NotebookURL) != "" {
+			var res mcp.CallToolResult
+			res.SetError(fmt.Errorf("a Colab browser session is already connected; close that browser connection before opening another notebook"))
+			return &res, nil
+		}
 		return boolToolResult(true), nil
 	}
 
@@ -27,11 +43,16 @@ func (m *Manager) openColabBrowserConnection(ctx context.Context, req *mcp.CallT
 		})
 	}
 
-	url := m.ws.BrowserURL()
-	if err := m.opener.Open(ctx, url); err != nil {
-		m.logger.Warn("failed to open Colab browser URL", "error", err, "url", url)
+	browserURL, err := m.ws.BrowserURL(in.NotebookURL)
+	if err != nil {
+		var res mcp.CallToolResult
+		res.SetError(err)
+		return &res, nil
+	}
+	if err := m.opener.Open(ctx, browserURL); err != nil {
+		m.logger.Warn("failed to open Colab browser URL", "error", err)
 	} else {
-		m.logger.Info("opened Colab browser URL", "url", url)
+		m.logger.Info("opened Colab browser URL")
 	}
 
 	if token != nil {
