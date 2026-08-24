@@ -30,7 +30,7 @@ func TestOpenToolDisconnectedOpensURLAndTimesOut(t *testing.T) {
 	ws := startWS(t, ctx)
 	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
 	opener := &fakeOpener{}
-	mgr := NewManager(local, ws, opener, 10*time.Millisecond, nil)
+	mgr := NewManager(context.Background(), local, ws, opener, 10*time.Millisecond, nil)
 
 	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
 		Params: &mcp.CallToolParamsRaw{Name: InjectedToolName},
@@ -55,7 +55,7 @@ func TestOpenToolUsesExistingNotebookURL(t *testing.T) {
 	ws := startWS(t, ctx)
 	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
 	opener := &fakeOpener{}
-	mgr := NewManager(local, ws, opener, 10*time.Millisecond, nil)
+	mgr := NewManager(context.Background(), local, ws, opener, 10*time.Millisecond, nil)
 
 	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
 		Params: &mcp.CallToolParamsRaw{
@@ -83,7 +83,7 @@ func TestOpenToolRejectsNonColabNotebookURL(t *testing.T) {
 	ws := startWS(t, ctx)
 	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
 	opener := &fakeOpener{}
-	mgr := NewManager(local, ws, opener, 10*time.Millisecond, nil)
+	mgr := NewManager(context.Background(), local, ws, opener, 10*time.Millisecond, nil)
 
 	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
 		Params: &mcp.CallToolParamsRaw{
@@ -109,7 +109,7 @@ func TestOpenToolAlreadyConnectedDoesNotOpenBrowser(t *testing.T) {
 	keepWSLive(t, ws)
 	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
 	opener := &fakeOpener{}
-	mgr := NewManager(local, ws, opener, time.Second, nil)
+	mgr := NewManager(context.Background(), local, ws, opener, time.Second, nil)
 	mgr.setRemoteSession(startRemoteMCP(t, ctx))
 
 	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
@@ -133,7 +133,7 @@ func TestOpenToolDoesNotSwitchAnActiveBrowserConnection(t *testing.T) {
 	keepWSLive(t, ws)
 	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
 	opener := &fakeOpener{}
-	mgr := NewManager(local, ws, opener, time.Second, nil)
+	mgr := NewManager(context.Background(), local, ws, opener, time.Second, nil)
 	mgr.setRemoteSession(startRemoteMCP(t, ctx))
 
 	res, err := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
@@ -159,7 +159,7 @@ func TestOpenToolConnectionArrivesBeforeTimeout(t *testing.T) {
 	ws := startWS(t, ctx)
 	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
 	opener := &fakeOpener{}
-	mgr := NewManager(local, ws, opener, time.Second, nil)
+	mgr := NewManager(context.Background(), local, ws, opener, time.Second, nil)
 
 	done := make(chan *mcp.CallToolResult, 1)
 	go func() {
@@ -180,12 +180,39 @@ func TestOpenToolConnectionArrivesBeforeTimeout(t *testing.T) {
 	}
 }
 
+func TestOpenToolStopsWhenApplicationContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	appCtx, stopApp := context.WithCancel(context.Background())
+	ws := startWS(t, ctx)
+	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	mgr := NewManager(appCtx, local, ws, &fakeOpener{}, time.Hour, nil)
+
+	done := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, _ := mgr.openColabBrowserConnection(context.Background(), &mcp.CallToolRequest{
+			Params: &mcp.CallToolParamsRaw{Name: InjectedToolName},
+		})
+		done <- res
+	}()
+	stopApp()
+
+	select {
+	case res := <-done:
+		if res.StructuredContent.(map[string]any)["result"] != false {
+			t.Fatalf("result = %#v, want false", res.StructuredContent)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("open tool did not stop after application cancellation")
+	}
+}
+
 func TestOpenToolSendsProgressNotifications(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ws := startWS(t, ctx)
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, 10*time.Millisecond, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, 10*time.Millisecond, nil)
 	mgr.RegisterInjectedTools()
 	progress := make(chan *mcp.ProgressNotificationParams, 3)
 	client := startLocalClient(t, ctx, localServer, &mcp.ClientOptions{
@@ -228,7 +255,7 @@ func TestRefreshRegistersRemoteToolAndForwardsCall(t *testing.T) {
 
 	remoteSession := startRemoteMCP(t, ctx)
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	mgr.RegisterInjectedTools()
 	mgr.setRemoteSession(remoteSession)
 	if err := mgr.RefreshTools(ctx); err != nil {
@@ -259,13 +286,54 @@ func TestRefreshRegistersRemoteToolAndForwardsCall(t *testing.T) {
 	}
 }
 
+func TestForwardToolCallStopsWhenApplicationContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	appCtx, stopApp := context.WithCancel(context.Background())
+	ws := startWS(t, ctx)
+	keepWSLive(t, ws)
+	remote, remoteSession := startMutableRemoteMCP(t, ctx)
+	started := make(chan struct{})
+	remote.AddTool(&mcp.Tool{Name: "block", InputSchema: emptyObjectSchema}, func(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	mgr := NewManager(appCtx, local, ws, &fakeOpener{}, time.Hour, nil)
+	mgr.setRemoteSession(remoteSession)
+
+	done := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, _ := mgr.forwardToolCall(context.Background(), "block", &mcp.CallToolRequest{
+			Params: &mcp.CallToolParamsRaw{Name: "block"},
+		})
+		done <- res
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("remote tool call did not start")
+	}
+	stopApp()
+
+	select {
+	case res := <-done:
+		if !res.IsError {
+			t.Fatalf("forwarded call result = %#v, want cancellation error", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forwarded tool call did not stop after application cancellation")
+	}
+}
+
 func TestDisconnectRemovesRemoteToolsAndReconnectRegistersAgain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ws := startWS(t, ctx)
 	keepWSLive(t, ws)
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	mgr.RegisterInjectedTools()
 	mgr.setRemoteSession(startRemoteMCP(t, ctx))
 	if err := mgr.RefreshTools(ctx); err != nil {
@@ -292,7 +360,7 @@ func TestRemoteToolListChangedRefreshesRegistry(t *testing.T) {
 	keepWSLive(t, ws)
 
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	remoteServer, remoteSession := startMutableRemoteMCPWithOptions(t, ctx, &mcp.ClientOptions{
 		ToolListChangedHandler:      mgr.remoteToolListChanged,
 		ProgressNotificationHandler: mgr.remoteProgress,
@@ -316,7 +384,7 @@ func TestRemoteProgressNotificationIsForwarded(t *testing.T) {
 	keepWSLive(t, ws)
 
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	_, remoteSession := startMutableRemoteMCPWithOptions(t, ctx, &mcp.ClientOptions{
 		ToolListChangedHandler:      mgr.remoteToolListChanged,
 		ProgressNotificationHandler: mgr.remoteProgress,
@@ -356,7 +424,7 @@ func TestReservedRemoteToolNameIsSkipped(t *testing.T) {
 	addEchoTool(remoteServer, InjectedToolName)
 
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	mgr.RegisterInjectedTools()
 	mgr.setRemoteSession(remoteSession)
 	if err := mgr.RefreshTools(ctx); err != nil {
@@ -385,7 +453,7 @@ func TestConcurrentToolCallsAndDisconnectMidCall(t *testing.T) {
 	keepWSLive(t, ws)
 	remoteSession := startRemoteMCP(t, ctx)
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	mgr.RegisterInjectedTools()
 	mgr.setRemoteSession(remoteSession)
 	if err := mgr.RefreshTools(ctx); err != nil {
@@ -416,7 +484,7 @@ func TestConcurrentToolCallsAndDisconnectMidCall(t *testing.T) {
 func TestReservedRemoteToolIsSkipped(t *testing.T) {
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
 	ws, _ := colabws.New("localhost", nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	if !isReservedTool(InjectedToolName) {
 		t.Fatal("injected tool should be reserved")
 	}

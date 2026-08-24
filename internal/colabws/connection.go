@@ -13,6 +13,8 @@ import (
 
 var ErrConnectionClosed = errors.New("websocket connection closed")
 
+const writeTimeout = 2 * time.Second
+
 // Connection wraps a Colab WebSocket as an MCP JSON-RPC connection.
 type Connection struct {
 	ws           *websocket.Conn
@@ -77,6 +79,23 @@ func (c *Connection) Write(ctx context.Context, msg jsonrpc.Message) error {
 	go func() {
 		c.writeMu.Lock()
 		defer c.writeMu.Unlock()
+		select {
+		case <-ctx.Done():
+			done <- ctx.Err()
+			return
+		case <-c.closed:
+			done <- ErrConnectionClosed
+			return
+		default:
+		}
+		deadline := time.Now().Add(writeTimeout)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err := c.ws.SetWriteDeadline(deadline); err != nil {
+			done <- err
+			return
+		}
 		done <- c.ws.WriteMessage(websocket.TextMessage, data)
 	}()
 	select {
@@ -94,11 +113,12 @@ func (c *Connection) Write(ctx context.Context, msg jsonrpc.Message) error {
 
 func (c *Connection) Close() error {
 	c.closeOnce.Do(func() {
+		c.signalClosed()
 		c.writeMu.Lock()
 		defer c.writeMu.Unlock()
+		_ = c.ws.SetWriteDeadline(time.Now().Add(writeTimeout))
 		_ = c.ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 		c.closeErr = c.ws.Close()
-		c.signalClosed()
 		if c.onClose != nil {
 			c.onClose()
 		}

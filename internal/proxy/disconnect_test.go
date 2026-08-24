@@ -18,7 +18,7 @@ func newDisconnectTestManager(t *testing.T, ctx context.Context) (*Manager, *mcp
 	keepWSLive(t, ws)
 	remoteServer, remoteSession := startMutableRemoteMCP(t, ctx)
 	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	mgr.setRemoteSession(remoteSession)
 	return mgr, remoteServer
 }
@@ -87,7 +87,7 @@ func TestDisconnectRuntimeNotConnected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	res := callDisconnect(t, mgr)
 	if !res.IsError {
 		t.Fatalf("expected error result, got %#v", res)
@@ -515,7 +515,7 @@ func TestDisconnectRuntimeConcurrentCallRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgr := NewManager(localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
 	mgr.disconnecting.Store(true)
 	res := callDisconnect(t, mgr)
 	if !res.IsError {

@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -42,6 +44,21 @@ func main() {
 
 	if err := app.New(cfg, logger).Run(ctx); err != nil && ctx.Err() == nil {
 		logger.Error("server exited", "error", err)
+		fmt.Fprintf(os.Stderr, "colab-mcp-go: %s\n", safeErrorMessage(err))
 		os.Exit(1)
 	}
+}
+
+func safeErrorMessage(err error) string {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "listen" {
+		return "server exited unexpectedly; see the log for details"
+	}
+	switch {
+	case errors.Is(err, syscall.EADDRINUSE):
+		return "failed to start WebSocket server: address already in use"
+	case errors.Is(err, syscall.EACCES):
+		return "failed to start WebSocket server: permission denied"
+	}
+	return "failed to start WebSocket server; see the log for details"
 }

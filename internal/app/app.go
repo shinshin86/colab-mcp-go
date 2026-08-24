@@ -6,12 +6,15 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shinshin86/colab-mcp-go/internal/browser"
 	"github.com/shinshin86/colab-mcp-go/internal/colabws"
@@ -31,6 +34,9 @@ func New(cfg Config, logger *slog.Logger) *App {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	appCtx, stopApp := context.WithCancel(ctx)
+	defer stopApp()
+
 	server := mcp.NewServer(&mcp.Implementation{Name: "ColabMCP", Version: Version}, &mcp.ServerOptions{
 		Logger:       a.Logger,
 		Instructions: "Connects to a user's Google Colab session in a browser and allows interactions with their Google Colab notebook.",
@@ -56,7 +62,7 @@ func (a *App) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := ws.Start(ctx); err != nil {
+		if err := ws.Start(appCtx); err != nil {
 			return err
 		}
 		defer ws.Close()
@@ -66,12 +72,62 @@ func (a *App) Run(ctx context.Context) error {
 			opener = loggingNoopOpener{logger: a.Logger}
 		}
 		proxy.Version = Version
-		mgr = proxy.NewManager(server, ws, opener, a.Config.ConnectTimeout, a.Logger)
+		mgr = proxy.NewManager(appCtx, server, ws, opener, a.Config.ConnectTimeout, a.Logger)
 		mgr.RegisterInjectedTools()
-		go mgr.Run(ctx)
 	}
 
-	return server.Run(ctx, &mcp.StdioTransport{})
+	managerDone := make(chan struct{})
+	if mgr != nil {
+		go func() {
+			defer close(managerDone)
+			mgr.Run(appCtx)
+		}()
+	} else {
+		close(managerDone)
+	}
+
+	transport := &cancelOnReadErrorTransport{
+		transport: &mcp.StdioTransport{},
+		cancel:    stopApp,
+	}
+	err := server.Run(appCtx, transport)
+	stopApp()
+	<-managerDone
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+// cancelOnReadErrorTransport turns stdio EOF (or another terminal read error)
+// into application cancellation. The MCP SDK otherwise waits for active tool
+// handlers before server.Run returns, so those handlers need this independent
+// shutdown signal to finish.
+type cancelOnReadErrorTransport struct {
+	transport mcp.Transport
+	cancel    context.CancelFunc
+}
+
+func (t *cancelOnReadErrorTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	conn, err := t.transport.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &cancelOnReadErrorConnection{Connection: conn, cancel: t.cancel}, nil
+}
+
+type cancelOnReadErrorConnection struct {
+	mcp.Connection
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancelOnReadErrorConnection) Read(ctx context.Context) (jsonrpc.Message, error) {
+	msg, err := c.Connection.Read(ctx)
+	if err != nil {
+		c.once.Do(c.cancel)
+	}
+	return msg, err
 }
 
 type loggingNoopOpener struct {

@@ -29,6 +29,7 @@ const (
 var emptyObjectSchema = map[string]any{"type": "object"}
 
 type Manager struct {
+	appCtx  context.Context
 	server  *mcp.Server
 	ws      *colabws.Server
 	opener  browser.Opener
@@ -50,7 +51,10 @@ type progressTarget struct {
 	token   any
 }
 
-func NewManager(server *mcp.Server, ws *colabws.Server, opener browser.Opener, timeout time.Duration, logger *slog.Logger) *Manager {
+func NewManager(appCtx context.Context, server *mcp.Server, ws *colabws.Server, opener browser.Opener, timeout time.Duration, logger *slog.Logger) *Manager {
+	if appCtx == nil {
+		appCtx = context.Background()
+	}
 	if opener == nil {
 		opener = browser.OSOpener{}
 	}
@@ -61,6 +65,7 @@ func NewManager(server *mcp.Server, ws *colabws.Server, opener browser.Opener, t
 		logger = slog.Default()
 	}
 	m := &Manager{
+		appCtx:          appCtx,
 		server:          server,
 		ws:              ws,
 		opener:          opener,
@@ -140,11 +145,21 @@ func (m *Manager) Run(ctx context.Context) {
 		if err := m.RefreshTools(ctx); err != nil {
 			m.logger.Warn("initial remote tools refresh failed", "error", err)
 		}
-		err = session.Wait()
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- session.Wait() }()
+		select {
+		case err = <-waitDone:
+		case <-ctx.Done():
+			_ = session.Close()
+			err = <-waitDone
+		}
 		if err != nil && !errors.Is(err, context.Canceled) {
 			m.logger.Info("remote MCP session ended", "error", err)
 		}
 		m.handleDisconnect()
+		if ctx.Err() != nil {
+			return
+		}
 	}
 }
 
@@ -155,6 +170,9 @@ func (m *Manager) IsConnected() bool {
 }
 
 func (m *Manager) WaitConnected(ctx context.Context) bool {
+	ctx, cancel := m.withAppCancellation(ctx)
+	defer cancel()
+
 	m.mu.RLock()
 	if m.remoteSession != nil && m.ws.Live() {
 		m.mu.RUnlock()
@@ -167,6 +185,15 @@ func (m *Manager) WaitConnected(ctx context.Context) bool {
 		return false
 	case <-ch:
 		return true
+	}
+}
+
+func (m *Manager) withAppCancellation(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(m.appCtx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
 	}
 }
 
@@ -189,8 +216,12 @@ func (m *Manager) remoteToolListChanged(_ context.Context, _ *mcp.ToolListChange
 		defer m.refreshing.Store(false)
 		timer := time.NewTimer(50 * time.Millisecond)
 		defer timer.Stop()
-		<-timer.C
-		if err := m.RefreshTools(context.Background()); err != nil {
+		select {
+		case <-timer.C:
+		case <-m.appCtx.Done():
+			return
+		}
+		if err := m.RefreshTools(m.appCtx); err != nil && m.appCtx.Err() == nil {
 			m.logger.Warn("remote tools refresh failed", "error", err)
 		}
 	}()
@@ -286,6 +317,9 @@ func (m *Manager) handleDisconnect() {
 }
 
 func (m *Manager) forwardToolCall(ctx context.Context, name string, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ctx, cancel := m.withAppCancellation(ctx)
+	defer cancel()
+
 	m.mu.RLock()
 	session := m.remoteSession
 	m.mu.RUnlock()
