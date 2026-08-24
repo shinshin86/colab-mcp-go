@@ -8,7 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -137,6 +139,35 @@ func (m *Manager) callColabTool(ctx context.Context, req *mcp.CallToolRequest) (
 	callParams.Arguments = in.Arguments
 	callReq.Params = &callParams
 	return m.forwardToolCall(ctx, in.Name, &callReq)
+}
+
+func (m *Manager) getColabConnectionStatus(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	m.mu.RLock()
+	remoteSessionActive := m.remoteSession != nil
+	remoteToolCount := len(m.remoteToolNames)
+	m.mu.RUnlock()
+
+	uptime := int64(time.Since(m.ws.StartedAt()).Seconds())
+	if uptime < 0 {
+		uptime = 0
+	}
+	status := map[string]any{
+		"pid":                   os.Getpid(),
+		"port":                  m.ws.Port(),
+		"browser_connected":     m.ws.Live(),
+		"remote_session_active": remoteSessionActive,
+		"remote_tool_count":     remoteToolCount,
+		"uptime_seconds":        uptime,
+		"version":               Version,
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResult{
+		Content:           []mcp.Content{&mcp.TextContent{Text: string(data)}},
+		StructuredContent: status,
+	}, nil
 }
 
 func boolToolResult(v bool) *mcp.CallToolResult {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -490,6 +491,32 @@ func TestReservedRemoteToolIsSkipped(t *testing.T) {
 	}
 	if _, ok := mgr.normalizedTool(&mcp.Tool{Name: "bad", InputSchema: map[string]any{"type": "string"}}); ok {
 		t.Fatal("non-object input schema should be skipped")
+	}
+}
+
+func TestConnectionStatusToolReportsOnlyLocalState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := startWS(t, ctx)
+	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr.remoteToolNames = map[string]struct{}{"echo": {}, "progress": {}}
+
+	res, err := mgr.getColabConnectionStatus(context.Background(), &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{Name: StatusToolName},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structured content = %#v", res.StructuredContent)
+	}
+	if status["pid"] != os.Getpid() || status["port"] != ws.Port() || status["browser_connected"] != false || status["remote_session_active"] != false || status["remote_tool_count"] != 2 || status["version"] != Version {
+		t.Fatalf("status = %#v", status)
+	}
+	if uptime, ok := status["uptime_seconds"].(int64); !ok || uptime < 0 {
+		t.Fatalf("uptime_seconds = %#v", status["uptime_seconds"])
 	}
 }
 

@@ -57,6 +57,12 @@ written to the server log. Use a different port and token file for each MCP
 client that may run concurrently. Do not commit or share the token file; to
 rotate it, stop the bridge and delete the file before the next start.
 
+When `--token-file` is set, the bridge also maintains a non-secret `state.json`
+beside it and holds an OS-backed single-instance lock for that token directory.
+The state records the PID, bound port, start time, browser connection state, and
+last update time. It is removed after a normal shutdown; the lock is released
+automatically by the OS if the process exits unexpectedly.
+
 ### Claude Code
 
 ```sh
@@ -119,6 +125,7 @@ so the open-connection call is not cancelled prematurely.
 
 ```sh
 colab-mcp-go [flags]
+colab-mcp-go doctor [flags]
 ```
 
 Flags:
@@ -138,6 +145,29 @@ Flags:
 - `--enable-proxy`: accepted for compatibility and enabled by default.
 - `--version`: print version and exit.
 
+`doctor` performs read-only local diagnostics and never kills, restarts, or
+repairs a process. Pass the same connection settings used by the bridge:
+
+```sh
+colab-mcp-go doctor \
+  --host localhost \
+  --port 8765 \
+  --token-file ~/.config/colab-mcp-go/connection-token \
+  --log ~/.config/colab-mcp-go/logs
+```
+
+It checks the listening port and owner when available, verifies `/healthz`,
+compares `state.json` with the live PID and port, validates token-file type and
+permissions, and recognizes common errors near the end of a supplied log file
+or directory. Add `--json` for machine-readable output. A healthy report exits
+with status 0; warnings and errors exit with status 1; invalid CLI usage exits
+with status 2.
+
+The local WebSocket HTTP server exposes unauthenticated `GET /healthz` for
+identity and liveness checks. Its response contains only the bridge name,
+version, PID, browser connection state, and start time. WebSocket origin and
+token checks remain unchanged.
+
 ## User Flow
 
 Initially, the local MCP server exposes these bridge tools:
@@ -145,6 +175,7 @@ Initially, the local MCP server exposes these bridge tools:
 - `open_colab_browser_connection`
 - `list_colab_tools`
 - `call_colab_tool`
+- `get_colab_connection_status`
 - `disconnect_colab_runtime`
 
 With no arguments, `open_colab_browser_connection` opens:
@@ -179,6 +210,10 @@ remote MCP client session over that WebSocket and dynamically registers the
 remote notebook tools on the local server. When the browser session disconnects,
 remote tools are removed and MCP clients receive
 `notifications/tools/list_changed`.
+
+`get_colab_connection_status` reads local bridge state only. It reports the
+PID, WebSocket port, browser and remote-session connection state, remote tool
+count, uptime, and version without making a Colab call.
 
 `disconnect_colab_runtime` disconnects and deletes the currently assigned Colab
 runtime (the same effect as "Runtime > Disconnect and delete runtime") by

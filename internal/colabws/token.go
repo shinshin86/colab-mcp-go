@@ -15,7 +15,7 @@ var errTokenFileIncomplete = errors.New("token file is incomplete")
 // LoadOrCreateToken reads a persistent browser connection token or creates one
 // with owner-only permissions. The file content is intentionally never logged.
 func LoadOrCreateToken(name string) (string, error) {
-	path, err := expandHome(name)
+	path, err := ResolveTokenPath(name)
 	if err != nil {
 		return "", err
 	}
@@ -58,6 +58,26 @@ func LoadOrCreateToken(name string) (string, error) {
 	}
 	removeOnError = false
 	return token, nil
+}
+
+// ResolveTokenPath expands a leading home-directory marker without reading or
+// creating the token file.
+func ResolveTokenPath(name string) (string, error) {
+	return expandHome(name)
+}
+
+// ValidateTokenFile checks an existing token file without changing it. The
+// token itself is deliberately not returned to callers such as doctor.
+func ValidateTokenFile(name string) error {
+	path, err := ResolveTokenPath(name)
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		return fmt.Errorf("token file path must not be empty")
+	}
+	_, err = readTokenFile(path)
+	return err
 }
 
 func readTokenFileWithRetry(path string) (string, error) {

@@ -18,6 +18,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shinshin86/colab-mcp-go/internal/browser"
 	"github.com/shinshin86/colab-mcp-go/internal/colabws"
+	"github.com/shinshin86/colab-mcp-go/internal/instance"
 	"github.com/shinshin86/colab-mcp-go/internal/proxy"
 )
 
@@ -45,27 +46,56 @@ func (a *App) Run(ctx context.Context) error {
 	var ws *colabws.Server
 	var mgr *proxy.Manager
 	if a.Config.EnableProxy {
+		startedAt := time.Now().UTC()
 		token := ""
+		var stateLock *instance.Lock
 		if a.Config.TokenFile != "" {
 			var err error
 			token, err = colabws.LoadOrCreateToken(a.Config.TokenFile)
 			if err != nil {
 				return fmt.Errorf("load browser connection token: %w", err)
 			}
+			stateLock, err = instance.Acquire(a.Config.TokenFile, instance.State{
+				PID:       os.Getpid(),
+				Port:      a.Config.Port,
+				StartedAt: startedAt,
+			})
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := stateLock.Close(); err != nil {
+					a.Logger.Warn("failed to clean up process state", "error", err)
+				}
+			}()
 		}
 		var err error
 		ws, err = colabws.NewWithOptions(colabws.Options{
-			Host:  a.Config.Host,
-			Port:  a.Config.Port,
-			Token: token,
+			Host:      a.Config.Host,
+			Port:      a.Config.Port,
+			Token:     token,
+			StartedAt: startedAt,
+			Version:   Version,
 		}, a.Logger)
 		if err != nil {
 			return err
+		}
+		if stateLock != nil {
+			ws.OnConnectionChange(func(connected bool) {
+				if err := stateLock.Update(ws.Port(), connected); err != nil {
+					a.Logger.Warn("failed to update browser connection state", "error", err)
+				}
+			})
 		}
 		if err := ws.Start(appCtx); err != nil {
 			return err
 		}
 		defer ws.Close()
+		if stateLock != nil {
+			if err := stateLock.Update(ws.Port(), ws.Live()); err != nil {
+				return fmt.Errorf("update process state: %w", err)
+			}
+		}
 
 		var opener browser.Opener = browser.OSOpener{}
 		if a.Config.NoBrowser {
