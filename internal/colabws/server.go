@@ -8,12 +8,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,13 +41,18 @@ type Server struct {
 	live      bool
 	accepted  chan *Connection
 	onDisc    []func()
+	onChange  []func(bool)
 	closeOnce sync.Once
+	startedAt time.Time
+	version   string
 }
 
 type Options struct {
-	Host  string
-	Port  int
-	Token string
+	Host      string
+	Port      int
+	Token     string
+	StartedAt time.Time
+	Version   string
 }
 
 func New(host string, logger *slog.Logger) (*Server, error) {
@@ -62,6 +69,9 @@ func NewWithOptions(options Options, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if options.StartedAt.IsZero() {
+		options.StartedAt = time.Now().UTC()
+	}
 	token := options.Token
 	if token == "" {
 		var err error
@@ -73,11 +83,13 @@ func NewWithOptions(options Options, logger *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		Host:     options.Host,
-		Logger:   logger,
-		token:    token,
-		bindPort: options.Port,
-		accepted: make(chan *Connection, 1),
+		Host:      options.Host,
+		Logger:    logger,
+		token:     token,
+		bindPort:  options.Port,
+		accepted:  make(chan *Connection, 1),
+		startedAt: options.StartedAt,
+		version:   options.Version,
 	}
 	s.upgrader = websocket.Upgrader{
 		Subprotocols: []string{Subprotocol},
@@ -98,6 +110,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("unexpected listener address %T", ln.Addr())
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", s.handleWebSocket)
 	s.httpServer = &http.Server{Handler: mux}
 	go func() {
@@ -141,6 +154,8 @@ func (s *Server) Token() string { return s.token }
 
 func (s *Server) Port() int { return s.port }
 
+func (s *Server) StartedAt() time.Time { return s.startedAt }
+
 func (s *Server) Live() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -157,6 +172,15 @@ func (s *Server) OnDisconnect(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onDisc = append(s.onDisc, fn)
+}
+
+// OnConnectionChange registers a callback for browser WebSocket connection
+// and disconnection transitions. Callbacks run without holding the server
+// mutex.
+func (s *Server) OnConnectionChange(fn func(bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onChange = append(s.onChange, fn)
 }
 
 func (s *Server) BrowserURL(notebookURL string) (string, error) {
@@ -206,7 +230,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn := newConnection(ws, s.clearConnection)
 	s.active = conn
 	s.live = true
+	callbacks := append([]func(bool){}, s.onChange...)
 	s.mu.Unlock()
+	for _, fn := range callbacks {
+		fn(true)
+	}
 
 	select {
 	case s.accepted <- conn:
@@ -218,6 +246,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) clearConnection() {
 	var callbacks []func()
+	var changeCallbacks []func(bool)
 	s.mu.Lock()
 	if s.active != nil {
 		s.active.signalClosed()
@@ -226,11 +255,40 @@ func (s *Server) clearConnection() {
 	if s.live {
 		s.live = false
 		callbacks = append(callbacks, s.onDisc...)
+		changeCallbacks = append(changeCallbacks, s.onChange...)
 	}
 	s.mu.Unlock()
 	for _, fn := range callbacks {
 		fn()
 	}
+	for _, fn := range changeCallbacks {
+		fn(false)
+	}
+}
+
+type healthResponse struct {
+	Name        string    `json:"name"`
+	Version     string    `json:"version"`
+	PID         int       `json:"pid"`
+	WSConnected bool      `json:"ws_connected"`
+	StartedAt   time.Time `json:"started_at"`
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(healthResponse{
+		Name:        "colab-mcp-go",
+		Version:     s.version,
+		PID:         os.Getpid(),
+		WSConnected: s.Live(),
+		StartedAt:   s.startedAt,
+	})
 }
 
 func (s *Server) validateAuthorization(r *http.Request) (int, string) {

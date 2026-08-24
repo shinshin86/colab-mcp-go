@@ -3,6 +3,7 @@ package tests
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -136,6 +137,48 @@ func TestShutdownLifecycle(t *testing.T) {
 		}
 		if err := waitForProcessExit(t, first.cmd, 5*time.Second); err != nil {
 			t.Fatalf("first process exit: %v; stderr=%s", err, first.stderr.String())
+		}
+		assertLifecycleOutputHasNoToken(t, first, firstDir)
+	})
+
+	t.Run("second process with same token file is rejected by instance lock", func(t *testing.T) {
+		first, firstDir, _ := startLifecycleProcess(t, bin, 0)
+		tokenFile := filepath.Join(firstDir, "connection-token")
+
+		secondDir := t.TempDir()
+		var stdout, stderr bytes.Buffer
+		second := exec.Command(bin,
+			"--no-browser",
+			"--host=127.0.0.1",
+			"--port=0",
+			"--token-file", tokenFile,
+			"--log", secondDir,
+		)
+		second.Stdin = strings.NewReader("")
+		second.Stdout = &stdout
+		second.Stderr = &stderr
+		if err := second.Start(); err != nil {
+			t.Fatal(err)
+		}
+		err := waitForProcessExit(t, second, 3*time.Second)
+		if err == nil {
+			t.Fatal("second process unexpectedly acquired the instance lock")
+		}
+		if !strings.Contains(stderr.String(), "already running") || !strings.Contains(stderr.String(), fmt.Sprintf("pid %d", first.cmd.Process.Pid)) || !strings.Contains(stderr.String(), "started at") {
+			t.Fatalf("stderr did not identify the lock owner safely: %q", stderr.String())
+		}
+		if strings.Contains(stdout.String(), lifecycleToken) || strings.Contains(stderr.String(), lifecycleToken) {
+			t.Fatal("connection token was exposed by the rejected process")
+		}
+
+		if err := first.stdin.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := waitForProcessExit(t, first.cmd, 5*time.Second); err != nil {
+			t.Fatalf("first process exit: %v; stderr=%s", err, first.stderr.String())
+		}
+		if _, err := os.Stat(filepath.Join(firstDir, "state.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("state.json was not removed after normal exit: %v", err)
 		}
 		assertLifecycleOutputHasNoToken(t, first, firstDir)
 	})

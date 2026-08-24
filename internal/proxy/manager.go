@@ -24,6 +24,7 @@ const (
 	InjectedToolName = "open_colab_browser_connection"
 	ListToolsName    = "list_colab_tools"
 	CallToolName     = "call_colab_tool"
+	StatusToolName   = "get_colab_connection_status"
 )
 
 var emptyObjectSchema = map[string]any{"type": "object"}
@@ -113,6 +114,28 @@ func (m *Manager) RegisterInjectedTools() {
 			},
 		},
 	}, m.callColabTool)
+
+	m.server.AddTool(&mcp.Tool{
+		Name:        StatusToolName,
+		Description: "Reports local Colab bridge connection state without calling the remote notebook.",
+		InputSchema: emptyObjectSchema,
+		OutputSchema: map[string]any{
+			"type": "object",
+			"required": []string{
+				"pid", "port", "browser_connected", "remote_session_active",
+				"remote_tool_count", "uptime_seconds", "version",
+			},
+			"properties": map[string]any{
+				"pid":                   map[string]any{"type": "integer"},
+				"port":                  map[string]any{"type": "integer"},
+				"browser_connected":     map[string]any{"type": "boolean"},
+				"remote_session_active": map[string]any{"type": "boolean"},
+				"remote_tool_count":     map[string]any{"type": "integer"},
+				"uptime_seconds":        map[string]any{"type": "integer"},
+				"version":               map[string]any{"type": "string"},
+			},
+		},
+	}, m.getColabConnectionStatus)
 
 	m.server.AddTool(&mcp.Tool{
 		Name:        DisconnectToolName,
@@ -430,7 +453,7 @@ func tokenKey(token any) string {
 }
 
 func isReservedTool(name string) bool {
-	return name == InjectedToolName || name == ListToolsName || name == CallToolName || name == DisconnectToolName
+	return name == InjectedToolName || name == ListToolsName || name == CallToolName || name == StatusToolName || name == DisconnectToolName
 }
 
 var Version = "v0.1.0"

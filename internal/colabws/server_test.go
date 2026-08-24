@@ -149,6 +149,62 @@ func TestConfiguredPortAndToken(t *testing.T) {
 	}
 }
 
+func TestHealthzReportsLocalStateWithoutToken(t *testing.T) {
+	startedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Nanosecond)
+	const token = "health_token_123456789012345"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, err := NewWithOptions(Options{
+		Host:      "127.0.0.1",
+		Token:     token,
+		StartedAt: startedAt,
+		Version:   "test-version",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	response, err := http.Get("http://127.0.0.1:" + strconv.Itoa(server.Port()) + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d", response.StatusCode)
+	}
+	var health healthResponse
+	if err := json.NewDecoder(response.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	if health.Name != "colab-mcp-go" || health.Version != "test-version" || health.PID <= 0 || health.WSConnected || !health.StartedAt.Equal(startedAt) {
+		t.Fatalf("health = %#v", health)
+	}
+	data, err := json.Marshal(health)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), token) {
+		t.Fatal("health response exposed the token")
+	}
+
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(server.Port())+"/healthz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer postResponse.Body.Close()
+	if postResponse.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST health status = %d", postResponse.StatusCode)
+	}
+}
+
 func TestBrowserURL(t *testing.T) {
 	s, _ := startTestServer(t)
 	tests := []struct {

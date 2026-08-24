@@ -57,6 +57,9 @@ func TestSubprocessStdoutContainsOnlyMCPMessages(t *testing.T) {
 	if !strings.Contains(listLine, "notebook_url") {
 		t.Fatalf("tools/list response did not include the existing-notebook argument: %s", listLine)
 	}
+	if !strings.Contains(listLine, "get_colab_connection_status") {
+		t.Fatalf("tools/list response did not include the connection status tool: %s", listLine)
+	}
 	if _, err := os.Stat(tokenFile); err != nil {
 		t.Fatalf("persistent token file was not created: %v", err)
 	}
@@ -66,7 +69,17 @@ func TestSubprocessStdoutContainsOnlyMCPMessages(t *testing.T) {
 	}
 	token := strings.TrimSpace(string(tokenData))
 
-	writeLine(t, stdin, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_colab_browser_connection","arguments":{}}}`)
+	writeLine(t, stdin, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_colab_connection_status","arguments":{}}}`)
+	statusLine := readLine(t, reader)
+	assertJSONRPCLine(t, statusLine)
+	if !strings.Contains(statusLine, `"browser_connected":false`) || !strings.Contains(statusLine, `"remote_session_active":false`) {
+		t.Fatalf("unexpected connection status response: %s", statusLine)
+	}
+	if strings.Contains(statusLine, token) {
+		t.Fatal("connection token was exposed by the status tool")
+	}
+
+	writeLine(t, stdin, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"open_colab_browser_connection","arguments":{}}}`)
 	openLine := readLine(t, reader)
 	assertJSONRPCLine(t, openLine)
 	if strings.Contains(openLine, token) {
