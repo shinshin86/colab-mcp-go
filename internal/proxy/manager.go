@@ -29,6 +29,23 @@ const (
 
 var emptyObjectSchema = map[string]any{"type": "object"}
 
+const (
+	// InstanceModePrimary means the bridge is bound to its configured port
+	// and, when a token file is configured, owns the shared state lock.
+	InstanceModePrimary = "primary"
+	// InstanceModeFallback means the configured port or the state lock was
+	// unavailable at startup and the bridge continued on an ephemeral port.
+	InstanceModeFallback = "fallback"
+)
+
+// InstanceInfo is non-secret startup information reported by
+// get_colab_connection_status.
+type InstanceInfo struct {
+	Mode           string
+	ConfiguredPort int
+	FallbackReason string
+}
+
 type Manager struct {
 	appCtx  context.Context
 	server  *mcp.Server
@@ -36,6 +53,7 @@ type Manager struct {
 	opener  browser.Opener
 	timeout time.Duration
 	logger  *slog.Logger
+	info    InstanceInfo
 
 	mu              sync.RWMutex
 	remoteSession   *mcp.ClientSession
@@ -80,6 +98,15 @@ func NewManager(appCtx context.Context, server *mcp.Server, ws *colabws.Server, 
 	return m
 }
 
+// SetInstanceInfo records how this bridge instance started. Call it before
+// RegisterInjectedTools.
+func (m *Manager) SetInstanceInfo(info InstanceInfo) {
+	if info.Mode == "" {
+		info.Mode = InstanceModePrimary
+	}
+	m.info = info
+}
+
 func (m *Manager) RegisterInjectedTools() {
 	m.server.AddTool(&mcp.Tool{
 		Name:        InjectedToolName,
@@ -117,13 +144,14 @@ func (m *Manager) RegisterInjectedTools() {
 
 	m.server.AddTool(&mcp.Tool{
 		Name:        StatusToolName,
-		Description: "Reports local Colab bridge connection state without calling the remote notebook.",
+		Description: "Reports local Colab bridge connection state without calling the remote notebook. instance_mode is 'primary' when the bridge owns its configured port and state lock, or 'fallback' when another bridge held them at startup and this process continued on an ephemeral port (fallback_reason explains why; the bridge still works normally).",
 		InputSchema: emptyObjectSchema,
 		OutputSchema: map[string]any{
 			"type": "object",
 			"required": []string{
 				"pid", "port", "browser_connected", "remote_session_active",
 				"remote_tool_count", "uptime_seconds", "version",
+				"instance_mode", "configured_port", "fallback_reason",
 			},
 			"properties": map[string]any{
 				"pid":                   map[string]any{"type": "integer"},
@@ -133,6 +161,9 @@ func (m *Manager) RegisterInjectedTools() {
 				"remote_tool_count":     map[string]any{"type": "integer"},
 				"uptime_seconds":        map[string]any{"type": "integer"},
 				"version":               map[string]any{"type": "string"},
+				"instance_mode":         map[string]any{"type": "string", "enum": []string{InstanceModePrimary, InstanceModeFallback}},
+				"configured_port":       map[string]any{"type": "integer"},
+				"fallback_reason":       map[string]any{"type": "string"},
 			},
 		},
 	}, m.getColabConnectionStatus)

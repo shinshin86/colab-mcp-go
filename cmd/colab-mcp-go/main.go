@@ -42,6 +42,7 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	flags.DurationVar(&cfg.ConnectTimeout, "connect-timeout", 60*time.Second, "Colab UI connection timeout")
 	flags.BoolVar(&cfg.NoBrowser, "no-browser", false, "do not open a browser when the connection tool is called")
 	flags.BoolVar(&cfg.EnableProxy, "enable-proxy", true, "enable the Colab browser session proxy")
+	flags.BoolVar(&cfg.NoFallback, "no-fallback", false, "exit instead of continuing on an ephemeral port when the configured port or instance lock is unavailable")
 	flags.BoolVar(&showVersion, "version", false, "print version and exit")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -56,6 +57,14 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	if cfg.LogDir == "" {
+		dir, err := app.DefaultLogDir(cfg.TokenFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "colab-mcp-go: resolve log directory: %v\n", err)
+			return 1
+		}
+		cfg.LogDir = dir
+	}
 	logger, cleanup, err := app.InitLogger(cfg.LogDir)
 	if err != nil {
 		log.New(stderr, "", log.LstdFlags).Printf("init logger: %v", err)
@@ -90,6 +99,15 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if flags.NArg() != 0 {
 		fmt.Fprintf(stderr, "colab-mcp-go doctor: unexpected argument %q\n", flags.Arg(0))
 		return 2
+	}
+	if options.Log == "" {
+		// Mirror the server default: logs live beside the token file unless
+		// --log was given. Only inspect the directory when it exists.
+		if dir, err := app.DefaultLogDir(options.TokenFile); err == nil && dir != "" {
+			if info, statErr := os.Stat(dir); statErr == nil && info.IsDir() {
+				options.Log = dir
+			}
+		}
 	}
 	report := doctor.Run(context.Background(), options)
 	if jsonOutput {

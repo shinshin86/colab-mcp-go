@@ -53,15 +53,25 @@ colab-mcp-go \
 ```
 
 The token file is created with owner-only permissions and its value is never
-written to the server log. Use a different port and token file for each MCP
-client that may run concurrently. Do not commit or share the token file; to
-rotate it, stop the bridge and delete the file before the next start.
+written to the server log. Do not commit or share the token file; to rotate
+it, stop the bridge and delete the file before the next start.
 
 When `--token-file` is set, the bridge also maintains a non-secret `state.json`
 beside it and holds an OS-backed single-instance lock for that token directory.
 The state records the PID, bound port, start time, browser connection state, and
 last update time. It is removed after a normal shutdown; the lock is released
-automatically by the OS if the process exits unexpectedly.
+automatically by the OS if the process exits unexpectedly. Log files default to
+a `logs` directory beside the token file unless `--log` is given.
+
+MCP clients often start one bridge process per session, window, or sub-agent,
+so several bridges may share the same configuration at the same time. Only the
+first process can own the fixed port and the state lock. Later processes do not
+exit: they continue on an ephemeral port without the shared lock, so each MCP
+client still gets a working `open_colab_browser_connection`. Such a process
+reports `instance_mode: "fallback"` and a `fallback_reason` from
+`get_colab_connection_status`, and its Colab tab reconnects only while that
+process is alive. Pass `--no-fallback` to restore the previous behaviour of
+exiting with an error instead.
 
 ### Claude Code
 
@@ -100,6 +110,14 @@ Colab tab to attach. The default of `60` is too short.
 `startup_timeout_sec` is usually not needed because the Go binary starts
 quickly. Add it only if your Codex client reports MCP server startup timeouts.
 
+Codex starts a separate bridge process for every thread that uses this
+configuration, including sub-agents and additional windows. With the fallback
+behaviour described in Quickstart, every thread receives working tools; the
+first process keeps port `8765` and the state lock, and later ones use an
+ephemeral port. If a thread reports that the Colab tools are missing, check the
+bridge log directory (`~/.config/colab-mcp-go/logs` with the settings above)
+and `colab-mcp-go doctor`.
+
 ### Generic stdio MCP clients (Claude Desktop, Cursor, Cline, etc.)
 
 ```json
@@ -130,8 +148,9 @@ colab-mcp-go doctor [flags]
 
 Flags:
 
-- `--log <dir>`: write log files to this directory. If unset, a temporary
-  `colab-mcp-go-logs-*` directory is created.
+- `--log <dir>`: write log files to this directory. If unset and
+  `--token-file` is set, a `logs` directory beside the token file is used;
+  otherwise a temporary `colab-mcp-go-logs-*` directory is created.
 - `--host <host>`: WebSocket bind host. Default: `localhost`.
 - `--port <port>`: WebSocket bind port. Default: `0`, which chooses an
   ephemeral port. Set a stable port together with `--token-file` to reconnect
@@ -142,6 +161,9 @@ Flags:
 - `--connect-timeout <duration>`: how long
   `open_colab_browser_connection` waits for the Colab UI. Default: `60s`.
 - `--no-browser`: do not open the browser, useful for tests and headless runs.
+- `--no-fallback`: exit with an error when the configured port or the
+  single-instance lock is unavailable, instead of continuing on an ephemeral
+  port (see Quickstart).
 - `--enable-proxy`: accepted for compatibility and enabled by default.
 - `--version`: print version and exit.
 
@@ -159,7 +181,8 @@ colab-mcp-go doctor \
 It checks the listening port and owner when available, verifies `/healthz`,
 compares `state.json` with the live PID and port, validates token-file type and
 permissions, and recognizes common errors near the end of a supplied log file
-or directory. Add `--json` for machine-readable output. A healthy report exits
+or directory. When `--log` is omitted and `--token-file` is set, the `logs`
+directory beside the token file is inspected if it exists. Add `--json` for machine-readable output. A healthy report exits
 with status 0; warnings and errors exit with status 1; invalid CLI usage exits
 with status 2.
 
@@ -201,9 +224,10 @@ reconnect automatically.
 The bridge accepts one browser connection at a time. Close the current Colab
 browser connection before using `notebook_url` to switch to another notebook.
 
-If the configured port is already in use, another bridge process may still be
-running. Stop that process or select a different port before restarting this
-server.
+If the configured port or the state lock is already taken, another bridge
+process is still running (for example one started by a different MCP client
+session). The new process then continues on an ephemeral port and reports
+`instance_mode: "fallback"`; pass `--no-fallback` to make it exit instead.
 
 After the Colab browser session connects over WebSocket, the bridge initializes a
 remote MCP client session over that WebSocket and dynamically registers the
@@ -213,7 +237,8 @@ remote tools are removed and MCP clients receive
 
 `get_colab_connection_status` reads local bridge state only. It reports the
 PID, WebSocket port, browser and remote-session connection state, remote tool
-count, uptime, and version without making a Colab call.
+count, uptime, version, `instance_mode` (`primary` or `fallback`),
+`configured_port`, and `fallback_reason` without making a Colab call.
 
 `disconnect_colab_runtime` disconnects and deletes the currently assigned Colab
 runtime (the same effect as "Runtime > Disconnect and delete runtime") by
