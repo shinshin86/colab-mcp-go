@@ -242,10 +242,14 @@ func InitLogger(logDir string) (*slog.Logger, func(), error) {
 			return nil, nil, err
 		}
 	}
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
+	// Owner-only: the default log directory sits beside the token file, and
+	// creating it must not widen the permissions of that directory tree.
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return nil, nil, err
 	}
-	name := filepath.Join(logDir, fmt.Sprintf("colab-mcp-go.%s.log", time.Now().Format("2006-01-02_15-04-05")))
+	// One file per process: concurrent bridges (one per MCP client session)
+	// commonly share the default directory and may start in the same second.
+	name := filepath.Join(logDir, fmt.Sprintf("colab-mcp-go.%s.%d.log", time.Now().Format("2006-01-02_15-04-05"), os.Getpid()))
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, nil, err

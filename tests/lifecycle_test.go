@@ -255,28 +255,55 @@ func TestShutdownLifecycle(t *testing.T) {
 		assertLifecycleOutputHasNoToken(t, first, firstDir)
 	})
 
-	t.Run("logs default to a directory beside the token file", func(t *testing.T) {
-		dir := t.TempDir()
+	t.Run("logs default to an owner-only directory beside the token file", func(t *testing.T) {
+		// The token directory does not exist yet: the log directory must be
+		// created without widening the permissions of the token's parent.
+		dir := filepath.Join(t.TempDir(), "bridge")
 		tokenFile := filepath.Join(dir, "connection-token")
-		writeLifecycleToken(t, tokenFile)
-		proc := &lifecycleProcess{}
-		proc.cmd = exec.Command(bin,
-			"--no-browser",
-			"--host=127.0.0.1",
-			"--port=0",
-			"--token-file", tokenFile,
-		)
-		proc.cmd.Stdin = strings.NewReader("")
-		proc.cmd.Stderr = &proc.stderr
-		if err := proc.cmd.Run(); err != nil {
-			t.Fatalf("process exit: %v; stderr=%s", err, proc.stderr.String())
+		var pids []int
+		for i := 0; i < 2; i++ {
+			var stderr bytes.Buffer
+			cmd := exec.Command(bin,
+				"--no-browser",
+				"--host=127.0.0.1",
+				"--port=0",
+				"--token-file", tokenFile,
+			)
+			cmd.Stdin = strings.NewReader("")
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("process %d exit: %v; stderr=%s", i, err, stderr.String())
+			}
+			pids = append(pids, cmd.ProcessState.Pid())
 		}
 		files, err := filepath.Glob(filepath.Join(dir, "logs", "colab-mcp-go.*.log"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(files) != 1 {
-			t.Fatalf("expected one log file beside the token file, got %v", files)
+		if len(files) != 2 {
+			t.Fatalf("expected one log file per process beside the token file, got %v", files)
+		}
+		for _, pid := range pids {
+			found := false
+			for _, name := range files {
+				if strings.HasSuffix(name, fmt.Sprintf(".%d.log", pid)) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no log file named after pid %d in %v", pid, files)
+			}
+		}
+		if runtime.GOOS != "windows" {
+			for _, name := range []string{dir, filepath.Join(dir, "logs")} {
+				info, err := os.Stat(name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if perm := info.Mode().Perm(); perm&0o077 != 0 {
+					t.Fatalf("%s permissions %o allow group or other access", name, perm)
+				}
+			}
 		}
 		assertLogDirHasNoToken(t, filepath.Join(dir, "logs"))
 	})

@@ -150,7 +150,9 @@ Flags:
 
 - `--log <dir>`: write log files to this directory. If unset and
   `--token-file` is set, a `logs` directory beside the token file is used;
-  otherwise a temporary `colab-mcp-go-logs-*` directory is created.
+  otherwise a temporary `colab-mcp-go-logs-*` directory is created. Each
+  process writes its own `colab-mcp-go.<timestamp>.<pid>.log` file, and
+  directories are created owner-only.
 - `--host <host>`: WebSocket bind host. Default: `localhost`.
 - `--port <port>`: WebSocket bind port. Default: `0`, which chooses an
   ephemeral port. Set a stable port together with `--token-file` to reconnect
