@@ -297,6 +297,7 @@ func inspectLog(name string) LogCheck {
 	lower := strings.ToLower(string(data))
 	patterns := []string{
 		"address already in use",
+		"another colab-mcp-go instance is already running",
 		"permission denied",
 		"invalid token file",
 		"browser connection token",

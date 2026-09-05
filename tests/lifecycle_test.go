@@ -3,10 +3,12 @@ package tests
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +27,7 @@ type lifecycleProcess struct {
 	stdout     *bufio.Reader
 	stdoutDone chan readAllResult
 	stderr     bytes.Buffer
+	initLine   string
 }
 
 type readAllResult struct {
@@ -94,7 +97,40 @@ func TestShutdownLifecycle(t *testing.T) {
 		assertLifecycleOutputHasNoToken(t, second, secondDir)
 	})
 
-	t.Run("second process reports address conflict safely", func(t *testing.T) {
+	t.Run("second process falls back to an ephemeral port when the fixed port is in use", func(t *testing.T) {
+		port := availableTCPPort(t)
+		first, firstDir, _ := startLifecycleProcess(t, bin, port)
+
+		secondDir := t.TempDir()
+		secondTokenFile := filepath.Join(secondDir, "connection-token")
+		writeLifecycleToken(t, secondTokenFile)
+		second := startLifecycleProcessWithOptions(t, bin, port, secondTokenFile, secondDir)
+		status := callStatusTool(t, second)
+		if status["instance_mode"] != "fallback" || status["configured_port"] != float64(port) {
+			t.Fatalf("second process status = %#v", status)
+		}
+		boundPort, _ := status["port"].(float64)
+		if boundPort <= 0 || int(boundPort) == port {
+			t.Fatalf("second process should be bound to a different ephemeral port, got %#v", status["port"])
+		}
+		if reason, _ := status["fallback_reason"].(string); !strings.Contains(reason, fmt.Sprintf("port %d", port)) || !strings.Contains(reason, "address already in use") {
+			t.Fatalf("fallback_reason = %q", reason)
+		}
+		if state := readStateJSON(t, secondDir); state["pid"] != float64(second.cmd.Process.Pid) || state["port"] != boundPort {
+			t.Fatalf("second process state.json = %#v", state)
+		}
+		assertHealthz(t, int(boundPort))
+		if !strings.Contains(readLogs(t, secondDir), "continuing on an ephemeral port") {
+			t.Fatal("second process log did not record the port fallback")
+		}
+		finishLifecycleProcess(t, second)
+		assertLifecycleOutputHasNoToken(t, second, secondDir)
+
+		finishLifecycleProcess(t, first)
+		assertLifecycleOutputHasNoToken(t, first, firstDir)
+	})
+
+	t.Run("second process reports address conflict safely with --no-fallback", func(t *testing.T) {
 		port := availableTCPPort(t)
 		first, firstDir, _ := startLifecycleProcess(t, bin, port)
 
@@ -104,6 +140,7 @@ func TestShutdownLifecycle(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		second := exec.Command(bin,
 			"--no-browser",
+			"--no-fallback",
 			"--connect-timeout=3600s",
 			"--host=127.0.0.1",
 			fmt.Sprintf("--port=%d", port),
@@ -132,16 +169,55 @@ func TestShutdownLifecycle(t *testing.T) {
 		}
 		assertLogDirHasNoToken(t, secondDir)
 
-		if err := first.stdin.Close(); err != nil {
-			t.Fatal(err)
+		finishLifecycleProcess(t, first)
+		assertLifecycleOutputHasNoToken(t, first, firstDir)
+	})
+
+	t.Run("second process with same token file falls back without the instance lock", func(t *testing.T) {
+		port := availableTCPPort(t)
+		first, firstDir, _ := startLifecycleProcess(t, bin, port)
+		tokenFile := filepath.Join(firstDir, "connection-token")
+
+		secondDir := t.TempDir()
+		second := startLifecycleProcessWithOptions(t, bin, port, tokenFile, secondDir)
+		status := callStatusTool(t, second)
+		if status["instance_mode"] != "fallback" || status["configured_port"] != float64(port) {
+			t.Fatalf("second process status = %#v", status)
 		}
-		if err := waitForProcessExit(t, first.cmd, 5*time.Second); err != nil {
-			t.Fatalf("first process exit: %v; stderr=%s", err, first.stderr.String())
+		boundPort, _ := status["port"].(float64)
+		if boundPort <= 0 || int(boundPort) == port {
+			t.Fatalf("second process should be bound to a different ephemeral port, got %#v", status["port"])
+		}
+		reason, _ := status["fallback_reason"].(string)
+		if !strings.Contains(reason, "instance lock unavailable") || !strings.Contains(reason, fmt.Sprintf("pid %d", first.cmd.Process.Pid)) {
+			t.Fatalf("fallback_reason = %q", reason)
+		}
+		if strings.Contains(reason, lifecycleToken) {
+			t.Fatal("fallback_reason exposed the connection token")
+		}
+		// The lock owner keeps state.json; the fallback process never writes it.
+		if state := readStateJSON(t, firstDir); state["pid"] != float64(first.cmd.Process.Pid) || state["port"] != float64(port) {
+			t.Fatalf("state.json no longer describes the lock owner: %#v", state)
+		}
+		assertHealthz(t, int(boundPort))
+		if !strings.Contains(readLogs(t, secondDir), "instance lock is held by another bridge") {
+			t.Fatal("second process log did not record the lock fallback")
+		}
+
+		finishLifecycleProcess(t, second)
+		assertLifecycleOutputHasNoToken(t, second, secondDir)
+		if _, err := os.Stat(filepath.Join(firstDir, "state.json")); err != nil {
+			t.Fatalf("state.json should survive the fallback process exit: %v", err)
+		}
+
+		finishLifecycleProcess(t, first)
+		if _, err := os.Stat(filepath.Join(firstDir, "state.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("state.json was not removed after the lock owner exited: %v", err)
 		}
 		assertLifecycleOutputHasNoToken(t, first, firstDir)
 	})
 
-	t.Run("second process with same token file is rejected by instance lock", func(t *testing.T) {
+	t.Run("second process with same token file is rejected by instance lock with --no-fallback", func(t *testing.T) {
 		first, firstDir, _ := startLifecycleProcess(t, bin, 0)
 		tokenFile := filepath.Join(firstDir, "connection-token")
 
@@ -149,6 +225,7 @@ func TestShutdownLifecycle(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		second := exec.Command(bin,
 			"--no-browser",
+			"--no-fallback",
 			"--host=127.0.0.1",
 			"--port=0",
 			"--token-file", tokenFile,
@@ -171,16 +248,64 @@ func TestShutdownLifecycle(t *testing.T) {
 			t.Fatal("connection token was exposed by the rejected process")
 		}
 
-		if err := first.stdin.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := waitForProcessExit(t, first.cmd, 5*time.Second); err != nil {
-			t.Fatalf("first process exit: %v; stderr=%s", err, first.stderr.String())
-		}
+		finishLifecycleProcess(t, first)
 		if _, err := os.Stat(filepath.Join(firstDir, "state.json")); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("state.json was not removed after normal exit: %v", err)
 		}
 		assertLifecycleOutputHasNoToken(t, first, firstDir)
+	})
+
+	t.Run("logs default to an owner-only directory beside the token file", func(t *testing.T) {
+		// The token directory does not exist yet: the log directory must be
+		// created without widening the permissions of the token's parent.
+		dir := filepath.Join(t.TempDir(), "bridge")
+		tokenFile := filepath.Join(dir, "connection-token")
+		var pids []int
+		for i := 0; i < 2; i++ {
+			var stderr bytes.Buffer
+			cmd := exec.Command(bin,
+				"--no-browser",
+				"--host=127.0.0.1",
+				"--port=0",
+				"--token-file", tokenFile,
+			)
+			cmd.Stdin = strings.NewReader("")
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("process %d exit: %v; stderr=%s", i, err, stderr.String())
+			}
+			pids = append(pids, cmd.ProcessState.Pid())
+		}
+		files, err := filepath.Glob(filepath.Join(dir, "logs", "colab-mcp-go.*.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(files) != 2 {
+			t.Fatalf("expected one log file per process beside the token file, got %v", files)
+		}
+		for _, pid := range pids {
+			found := false
+			for _, name := range files {
+				if strings.HasSuffix(name, fmt.Sprintf(".%d.log", pid)) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no log file named after pid %d in %v", pid, files)
+			}
+		}
+		if runtime.GOOS != "windows" {
+			for _, name := range []string{dir, filepath.Join(dir, "logs")} {
+				info, err := os.Stat(name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if perm := info.Mode().Perm(); perm&0o077 != 0 {
+					t.Fatalf("%s permissions %o allow group or other access", name, perm)
+				}
+			}
+		}
+		assertLogDirHasNoToken(t, filepath.Join(dir, "logs"))
 	})
 }
 
@@ -201,15 +326,28 @@ func startLifecycleProcess(t *testing.T, bin string, port int) (*lifecycleProces
 	dir := t.TempDir()
 	tokenFile := filepath.Join(dir, "connection-token")
 	writeLifecycleToken(t, tokenFile)
+	proc := startLifecycleProcessWithOptions(t, bin, port, tokenFile, dir)
+	drainLifecycleStdout(proc)
+	return proc, dir, proc.initLine
+}
+
+// startLifecycleProcessWithOptions starts the bridge, completes the MCP
+// initialize handshake, and leaves stdout readable so tests can exchange more
+// messages. Call finishLifecycleProcess (or drainLifecycleStdout) before
+// assertLifecycleOutputHasNoToken.
+func startLifecycleProcessWithOptions(t *testing.T, bin string, port int, tokenFile, logDir string, extraArgs ...string) *lifecycleProcess {
+	t.Helper()
 	proc := &lifecycleProcess{}
-	proc.cmd = exec.Command(bin,
+	args := []string{
 		"--no-browser",
 		"--connect-timeout=3600s",
 		"--host=127.0.0.1",
 		fmt.Sprintf("--port=%d", port),
 		"--token-file", tokenFile,
-		"--log", dir,
-	)
+		"--log", logDir,
+	}
+	args = append(args, extraArgs...)
+	proc.cmd = exec.Command(bin, args...)
 	stdin, err := proc.cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -235,15 +373,106 @@ func startLifecycleProcess(t *testing.T, bin string, port int) (*lifecycleProces
 	initLine := readLine(t, proc.stdout)
 	assertJSONRPCLine(t, initLine)
 	if !strings.Contains(initLine, `"id":1`) {
-		t.Fatalf("unexpected initialize response: %s", initLine)
+		t.Fatalf("unexpected initialize response: %s; stderr=%s", initLine, proc.stderr.String())
 	}
 	writeLine(t, proc.stdin, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	proc.initLine = initLine
+	return proc
+}
+
+// drainLifecycleStdout starts collecting the remaining stdout so
+// assertLifecycleOutputHasNoToken can inspect it after exit.
+func drainLifecycleStdout(proc *lifecycleProcess) {
+	if proc.stdoutDone != nil {
+		return
+	}
 	proc.stdoutDone = make(chan readAllResult, 1)
 	go func() {
 		data, err := io.ReadAll(proc.stdout)
 		proc.stdoutDone <- readAllResult{data: data, err: err}
 	}()
-	return proc, dir, initLine
+}
+
+// finishLifecycleProcess closes stdin and waits for a clean exit.
+func finishLifecycleProcess(t *testing.T, proc *lifecycleProcess) {
+	t.Helper()
+	drainLifecycleStdout(proc)
+	if err := proc.stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForProcessExit(t, proc.cmd, 5*time.Second); err != nil {
+		t.Fatalf("process exit: %v; stderr=%s", err, proc.stderr.String())
+	}
+}
+
+// callStatusTool calls get_colab_connection_status and returns its
+// structured content.
+func callStatusTool(t *testing.T, proc *lifecycleProcess) map[string]any {
+	t.Helper()
+	writeLine(t, proc.stdin, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_colab_connection_status","arguments":{}}}`)
+	for {
+		line := readLine(t, proc.stdout)
+		assertJSONRPCLine(t, line)
+		var msg struct {
+			ID     any `json:"id"`
+			Result struct {
+				IsError           bool           `json:"isError"`
+				StructuredContent map[string]any `json:"structuredContent"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		if msg.ID != float64(2) {
+			continue // notifications such as tools/list_changed
+		}
+		if msg.Result.IsError || msg.Result.StructuredContent == nil {
+			t.Fatalf("status call failed: %s", line)
+		}
+		return msg.Result.StructuredContent
+	}
+}
+
+func readStateJSON(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+func readLogs(t *testing.T, dir string) string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "colab-mcp-go.*.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, name := range files {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(data)
+	}
+	return b.String()
+}
+
+func assertHealthz(t *testing.T, port int) {
+	t.Helper()
+	res, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
+	if err != nil {
+		t.Fatalf("healthz on port %d: %v", port, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("healthz on port %d returned %d", port, res.StatusCode)
+	}
 }
 
 func startConnectionWait(t *testing.T, proc *lifecycleProcess, logDir string) {

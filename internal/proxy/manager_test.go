@@ -518,6 +518,39 @@ func TestConnectionStatusToolReportsOnlyLocalState(t *testing.T) {
 	if uptime, ok := status["uptime_seconds"].(int64); !ok || uptime < 0 {
 		t.Fatalf("uptime_seconds = %#v", status["uptime_seconds"])
 	}
+	if status["instance_mode"] != InstanceModePrimary || status["configured_port"] != 0 || status["fallback_reason"] != "" {
+		t.Fatalf("default instance fields = %#v", status)
+	}
+}
+
+func TestConnectionStatusToolReportsFallbackInstance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := startWS(t, ctx)
+	localServer := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	mgr := NewManager(context.Background(), localServer, ws, &fakeOpener{}, time.Second, nil)
+	mgr.SetInstanceInfo(InstanceInfo{
+		Mode:           InstanceModeFallback,
+		ConfiguredPort: 8765,
+		FallbackReason: "port 8765 unavailable: address already in use",
+	})
+
+	res, err := mgr.getColabConnectionStatus(context.Background(), &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{Name: StatusToolName},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structured content = %#v", res.StructuredContent)
+	}
+	if status["instance_mode"] != InstanceModeFallback || status["configured_port"] != 8765 || status["fallback_reason"] != "port 8765 unavailable: address already in use" {
+		t.Fatalf("fallback instance fields = %#v", status)
+	}
+	if status["port"] != ws.Port() || status["port"] == 8765 {
+		t.Fatalf("port should be the bound ephemeral port, got %#v", status["port"])
+	}
 }
 
 func startRemoteMCP(t *testing.T, ctx context.Context) *mcp.ClientSession {

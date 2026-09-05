@@ -151,6 +151,10 @@ func (m *Manager) getColabConnectionStatus(_ context.Context, _ *mcp.CallToolReq
 	if uptime < 0 {
 		uptime = 0
 	}
+	mode := m.info.Mode
+	if mode == "" {
+		mode = InstanceModePrimary
+	}
 	status := map[string]any{
 		"pid":                   os.Getpid(),
 		"port":                  m.ws.Port(),
@@ -159,6 +163,9 @@ func (m *Manager) getColabConnectionStatus(_ context.Context, _ *mcp.CallToolReq
 		"remote_tool_count":     remoteToolCount,
 		"uptime_seconds":        uptime,
 		"version":               Version,
+		"instance_mode":         mode,
+		"configured_port":       m.info.ConfiguredPort,
+		"fallback_reason":       m.info.FallbackReason,
 	}
 	data, err := json.Marshal(status)
 	if err != nil {

@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -48,6 +50,8 @@ func (a *App) Run(ctx context.Context) error {
 	if a.Config.EnableProxy {
 		startedAt := time.Now().UTC()
 		token := ""
+		bindPort := a.Config.Port
+		info := proxy.InstanceInfo{Mode: proxy.InstanceModePrimary, ConfiguredPort: a.Config.Port}
 		var stateLock *instance.Lock
 		if a.Config.TokenFile != "" {
 			var err error
@@ -61,34 +65,53 @@ func (a *App) Run(ctx context.Context) error {
 				StartedAt: startedAt,
 			})
 			if err != nil {
-				return err
-			}
-			defer func() {
-				if err := stateLock.Close(); err != nil {
-					a.Logger.Warn("failed to clean up process state", "error", err)
+				var already *instance.AlreadyRunningError
+				if a.Config.NoFallback || !errors.As(err, &already) {
+					return err
 				}
-			}()
+				// Another bridge owns the shared state lock (and most likely
+				// the configured port). Keep serving this MCP client on an
+				// ephemeral port instead of exiting, so the client still gets
+				// a working set of tools. The lock owner keeps state.json.
+				stateLock = nil
+				bindPort = 0
+				info.Mode = proxy.InstanceModeFallback
+				info.FallbackReason = "instance lock unavailable: " + already.SafeMessage()
+				attrs := []any{"configured_port", a.Config.Port}
+				if already.Owner != nil {
+					attrs = append(attrs, "owner_pid", already.Owner.PID, "owner_started_at", already.Owner.StartedAt)
+				}
+				a.Logger.Warn("instance lock is held by another bridge; continuing on an ephemeral port without the shared state lock", attrs...)
+			} else {
+				defer func() {
+					if err := stateLock.Close(); err != nil {
+						a.Logger.Warn("failed to clean up process state", "error", err)
+					}
+				}()
+			}
 		}
-		var err error
-		ws, err = colabws.NewWithOptions(colabws.Options{
-			Host:      a.Config.Host,
-			Port:      a.Config.Port,
-			Token:     token,
-			StartedAt: startedAt,
-			Version:   Version,
-		}, a.Logger)
-		if err != nil {
-			return err
-		}
+		var onChange func(port int, connected bool)
 		if stateLock != nil {
-			ws.OnConnectionChange(func(connected bool) {
-				if err := stateLock.Update(ws.Port(), connected); err != nil {
+			onChange = func(port int, connected bool) {
+				if err := stateLock.Update(port, connected); err != nil {
 					a.Logger.Warn("failed to update browser connection state", "error", err)
 				}
-			})
+			}
 		}
-		if err := ws.Start(appCtx); err != nil {
-			return err
+		var err error
+		ws, err = a.startWebSocketServer(appCtx, bindPort, token, startedAt, onChange)
+		if err != nil {
+			if bindPort == 0 || a.Config.NoFallback || !isListenError(err) {
+				return err
+			}
+			reason := fmt.Sprintf("port %d unavailable: %s", bindPort, listenErrorReason(err))
+			a.Logger.Warn("configured port is unavailable; continuing on an ephemeral port", "port", bindPort, "reason", listenErrorReason(err))
+			ws, err = a.startWebSocketServer(appCtx, 0, token, startedAt, onChange)
+			if err != nil {
+				return err
+			}
+			info.Mode = proxy.InstanceModeFallback
+			info.FallbackReason = reason
 		}
 		defer ws.Close()
 		if stateLock != nil {
@@ -103,6 +126,7 @@ func (a *App) Run(ctx context.Context) error {
 		}
 		proxy.Version = Version
 		mgr = proxy.NewManager(appCtx, server, ws, opener, a.Config.ConnectTimeout, a.Logger)
+		mgr.SetInstanceInfo(info)
 		mgr.RegisterInjectedTools()
 	}
 
@@ -127,6 +151,47 @@ func (a *App) Run(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// startWebSocketServer creates and starts the browser WebSocket server on the
+// requested port. onChange, when set, is registered before the listener opens
+// so no browser connection transition can be missed.
+func (a *App) startWebSocketServer(ctx context.Context, port int, token string, startedAt time.Time, onChange func(port int, connected bool)) (*colabws.Server, error) {
+	ws, err := colabws.NewWithOptions(colabws.Options{
+		Host:      a.Config.Host,
+		Port:      port,
+		Token:     token,
+		StartedAt: startedAt,
+		Version:   Version,
+	}, a.Logger)
+	if err != nil {
+		return nil, err
+	}
+	if onChange != nil {
+		ws.OnConnectionChange(func(connected bool) { onChange(ws.Port(), connected) })
+	}
+	if err := ws.Start(ctx); err != nil {
+		return nil, err
+	}
+	return ws, nil
+}
+
+func isListenError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "listen"
+}
+
+// listenErrorReason describes a listen failure without echoing the full
+// operating system error text.
+func listenErrorReason(err error) string {
+	switch {
+	case errors.Is(err, syscall.EADDRINUSE):
+		return "address already in use"
+	case errors.Is(err, syscall.EACCES):
+		return "permission denied"
+	default:
+		return "listen failed"
+	}
 }
 
 // cancelOnReadErrorTransport turns stdio EOF (or another terminal read error)
@@ -177,10 +242,14 @@ func InitLogger(logDir string) (*slog.Logger, func(), error) {
 			return nil, nil, err
 		}
 	}
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
+	// Owner-only: the default log directory sits beside the token file, and
+	// creating it must not widen the permissions of that directory tree.
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return nil, nil, err
 	}
-	name := filepath.Join(logDir, fmt.Sprintf("colab-mcp-go.%s.log", time.Now().Format("2006-01-02_15-04-05")))
+	// One file per process: concurrent bridges (one per MCP client session)
+	// commonly share the default directory and may start in the same second.
+	name := filepath.Join(logDir, fmt.Sprintf("colab-mcp-go.%s.%d.log", time.Now().Format("2006-01-02_15-04-05"), os.Getpid()))
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, nil, err
