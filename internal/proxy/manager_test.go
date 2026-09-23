@@ -50,6 +50,97 @@ func TestOpenToolDisconnectedOpensURLAndTimesOut(t *testing.T) {
 	}
 }
 
+func TestStalledRemoteHandshakeTimesOutAndNextBrowserConnects(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := startWS(t, ctx)
+	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	mgr := NewManager(ctx, local, ws, &fakeOpener{}, time.Second, nil)
+	mgr.handshakeTimeout = 75 * time.Millisecond
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client"}, nil)
+
+	type result struct {
+		session *mcp.ClientSession
+		release context.CancelFunc
+		err     error
+	}
+	connect := func() <-chan result {
+		ch := make(chan result, 1)
+		go func() {
+			session, release, err := mgr.connectRemote(ctx, client)
+			ch <- result{session, release, err}
+		}()
+		return ch
+	}
+
+	firstResult := connect()
+	first := dialBrowser(t, ws)
+	defer first.Close()
+	select {
+	case got := <-firstResult:
+		if got.err == nil || got.session != nil {
+			t.Fatalf("silent browser unexpectedly completed MCP handshake: %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("MCP handshake did not time out")
+	}
+
+	secondResult := connect()
+	second := dialBrowser(t, ws)
+	defer second.Close()
+	_, requestData, err := second.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		ID     json.RawMessage `json:"id"`
+		Params struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(requestData, &request); err != nil {
+		t.Fatal(err)
+	}
+	response, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": request.ID,
+		"result": map[string]any{
+			"protocolVersion": request.Params.ProtocolVersion,
+			"capabilities":    map[string]any{},
+			"serverInfo":      map[string]any{"name": "test-browser", "version": "1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.WriteMessage(websocket.TextMessage, response); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-secondResult:
+		if got.err != nil || got.session == nil || got.release == nil {
+			t.Fatalf("second browser did not complete MCP handshake: %v", got.err)
+		}
+		got.release()
+		_ = got.session.Close()
+	case <-time.After(time.Second):
+		t.Fatal("second browser was not accepted after stalled handshake")
+	}
+}
+
+func dialBrowser(t *testing.T, ws *colabws.Server) *websocket.Conn {
+	t.Helper()
+	header := http.Header{}
+	header.Set("Origin", colabws.ColabAlternativeURL)
+	header.Set("Authorization", "Bearer "+ws.Token())
+	dialer := *websocket.DefaultDialer
+	dialer.Subprotocols = []string{colabws.Subprotocol}
+	conn, _, err := dialer.Dial("ws://localhost:"+strconv.Itoa(ws.Port()), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
 func TestOpenToolUsesExistingNotebookURL(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

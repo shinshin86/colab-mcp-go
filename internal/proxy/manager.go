@@ -25,6 +25,9 @@ const (
 	ListToolsName    = "list_colab_tools"
 	CallToolName     = "call_colab_tool"
 	StatusToolName   = "get_colab_connection_status"
+	// A browser WebSocket that never completes MCP initialization must not
+	// prevent this bridge from accepting future reconnects indefinitely.
+	remoteHandshakeTimeout = 30 * time.Second
 )
 
 var emptyObjectSchema = map[string]any{"type": "object"}
@@ -47,13 +50,14 @@ type InstanceInfo struct {
 }
 
 type Manager struct {
-	appCtx  context.Context
-	server  *mcp.Server
-	ws      *colabws.Server
-	opener  browser.Opener
-	timeout time.Duration
-	logger  *slog.Logger
-	info    InstanceInfo
+	appCtx           context.Context
+	server           *mcp.Server
+	ws               *colabws.Server
+	opener           browser.Opener
+	timeout          time.Duration
+	handshakeTimeout time.Duration
+	logger           *slog.Logger
+	info             InstanceInfo
 
 	mu              sync.RWMutex
 	remoteSession   *mcp.ClientSession
@@ -84,15 +88,16 @@ func NewManager(appCtx context.Context, server *mcp.Server, ws *colabws.Server, 
 		logger = slog.Default()
 	}
 	m := &Manager{
-		appCtx:          appCtx,
-		server:          server,
-		ws:              ws,
-		opener:          opener,
-		timeout:         timeout,
-		logger:          logger,
-		remoteToolNames: map[string]struct{}{},
-		connectedCh:     make(chan struct{}),
-		progress:        map[string]progressTarget{},
+		appCtx:           appCtx,
+		server:           server,
+		ws:               ws,
+		opener:           opener,
+		timeout:          timeout,
+		handshakeTimeout: remoteHandshakeTimeout,
+		logger:           logger,
+		remoteToolNames:  map[string]struct{}{},
+		connectedCh:      make(chan struct{}),
+		progress:         map[string]progressTarget{},
 	}
 	ws.OnDisconnect(m.handleDisconnect)
 	return m
@@ -185,7 +190,7 @@ func (m *Manager) Run(ctx context.Context) {
 			ProgressNotificationHandler: m.remoteProgress,
 			Logger:                      m.logger,
 		})
-		session, err := client.Connect(ctx, mcptransport.New(m.ws), nil)
+		session, release, err := m.connectRemote(ctx, client)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -211,10 +216,42 @@ func (m *Manager) Run(ctx context.Context) {
 			m.logger.Info("remote MCP session ended", "error", err)
 		}
 		m.handleDisconnect()
+		release()
 		if ctx.Err() != nil {
 			return
 		}
 	}
+}
+
+func (m *Manager) connectRemote(ctx context.Context, client *mcp.Client) (*mcp.ClientSession, context.CancelFunc, error) {
+	conn, err := m.ws.WaitConnection(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// The SDK uses the Connect context for the entire session lifetime. Keep
+	// that context alive after initialization, but bound the initial handshake.
+	sessionCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-conn.Done():
+			cancel()
+		case <-sessionCtx.Done():
+		}
+	}()
+	timer := time.AfterFunc(m.handshakeTimeout, func() {
+		m.logger.Warn("remote MCP initialization timed out; closing browser connection")
+		cancel()
+		_ = conn.Close()
+	})
+	session, err := client.Connect(sessionCtx, mcptransport.NewConnected(conn), nil)
+	timer.Stop()
+	if err != nil {
+		cancel()
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return session, cancel, nil
 }
 
 func (m *Manager) IsConnected() bool {
