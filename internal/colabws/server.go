@@ -142,11 +142,20 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) WaitConnection(ctx context.Context) (*Connection, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case c := <-s.accepted:
-		return c, nil
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case c := <-s.accepted:
+			// A browser may have disconnected while the proxy was finishing
+			// its previous session. Never hand that stale socket to MCP.
+			select {
+			case <-c.Done():
+				continue
+			default:
+				return c, nil
+			}
+		}
 	}
 }
 

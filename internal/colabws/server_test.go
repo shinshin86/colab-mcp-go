@@ -332,6 +332,34 @@ func TestDisconnectClearsLive(t *testing.T) {
 	waitFalse(t, s.Live)
 }
 
+func TestWaitConnectionSkipsBrowserThatAlreadyDisconnected(t *testing.T) {
+	s, _ := startTestServer(t)
+	browser, _, err := dial(t, s, ColabAlternativeURL, s.Token())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = browser.Close()
+	waitFalse(t, s.Live)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := s.WaitConnection(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("stale connection returned instead of waiting: %v", err)
+	}
+
+	fresh, _, err := dial(t, s, ColabAlternativeURL, s.Token())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	conn := waitConn(t, s)
+	select {
+	case <-conn.Done():
+		t.Fatal("fresh connection was closed")
+	default:
+	}
+}
+
 func waitConn(t *testing.T, s *Server) *Connection {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
