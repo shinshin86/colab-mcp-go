@@ -127,6 +127,88 @@ func TestStalledRemoteHandshakeTimesOutAndNextBrowserConnects(t *testing.T) {
 	}
 }
 
+func TestManagerReconnectsAfterBrowserCloses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ws := startWS(t, ctx)
+	local := mcp.NewServer(&mcp.Implementation{Name: "local"}, nil)
+	mgr := NewManager(ctx, local, ws, &fakeOpener{}, time.Second, nil)
+	mgr.handshakeTimeout = time.Second
+	done := make(chan struct{})
+	go func() {
+		mgr.Run(ctx)
+		close(done)
+	}()
+
+	first := dialRespondingBrowser(t, ws)
+	waitManagerConnected(t, mgr, true)
+	_ = first.Close()
+	waitManagerConnected(t, mgr, false)
+
+	second := dialRespondingBrowser(t, ws)
+	waitManagerConnected(t, mgr, true)
+	_ = second.Close()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manager did not stop after reconnecting")
+	}
+}
+
+func dialRespondingBrowser(t *testing.T, ws *colabws.Server) *websocket.Conn {
+	t.Helper()
+	conn := dialBrowser(t, ws)
+	go func() {
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var request struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params struct {
+					ProtocolVersion string `json:"protocolVersion"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(data, &request) != nil || len(request.ID) == 0 {
+				continue
+			}
+			var result any
+			switch request.Method {
+			case "initialize":
+				result = map[string]any{
+					"protocolVersion": request.Params.ProtocolVersion,
+					"capabilities":    map[string]any{},
+					"serverInfo":      map[string]any{"name": "test-browser", "version": "1"},
+				}
+			case "tools/list":
+				result = map[string]any{"tools": []any{}}
+			default:
+				result = map[string]any{}
+			}
+			response, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+			if err != nil || conn.WriteMessage(websocket.TextMessage, response) != nil {
+				return
+			}
+		}
+	}()
+	return conn
+}
+
+func waitManagerConnected(t *testing.T, mgr *Manager, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if mgr.IsConnected() == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("manager connected = %t, want %t", mgr.IsConnected(), want)
+}
+
 func dialBrowser(t *testing.T, ws *colabws.Server) *websocket.Conn {
 	t.Helper()
 	header := http.Header{}
