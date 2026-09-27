@@ -382,10 +382,11 @@ func (m *Manager) RefreshTools(ctx context.Context) error {
 }
 
 func (m *Manager) handleDisconnect() {
-	var session *mcp.ClientSession
+	// This also runs inside the WebSocket close callback. Closing the MCP
+	// session here can wait for that same read loop and deadlock reconnects.
+	// The closed transport makes session.Wait return in Run instead.
 	var names []string
 	m.mu.Lock()
-	session = m.remoteSession
 	m.remoteSession = nil
 	for name := range m.remoteToolNames {
 		names = append(names, name)
@@ -399,9 +400,6 @@ func (m *Manager) handleDisconnect() {
 	}
 	m.mu.Unlock()
 
-	if session != nil {
-		_ = session.Close()
-	}
 	if len(names) > 0 {
 		m.server.RemoveTools(names...)
 	}

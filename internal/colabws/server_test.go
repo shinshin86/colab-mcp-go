@@ -332,6 +332,26 @@ func TestDisconnectClearsLive(t *testing.T) {
 	waitFalse(t, s.Live)
 }
 
+func TestDisconnectCallbackCanCloseSameConnection(t *testing.T) {
+	s, _ := startTestServer(t)
+	browser, _, err := dial(t, s, ColabAlternativeURL, s.Token())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := waitConn(t, s)
+	done := make(chan struct{})
+	s.OnDisconnect(func() {
+		_ = conn.Close()
+		close(done)
+	})
+	_ = browser.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect callback deadlocked while closing the same connection")
+	}
+}
+
 func TestWaitConnectionSkipsBrowserThatAlreadyDisconnected(t *testing.T) {
 	s, _ := startTestServer(t)
 	browser, _, err := dial(t, s, ColabAlternativeURL, s.Token())

@@ -112,6 +112,7 @@ func (c *Connection) Write(ctx context.Context, msg jsonrpc.Message) error {
 }
 
 func (c *Connection) Close() error {
+	didClose := false
 	c.closeOnce.Do(func() {
 		c.signalClosed()
 		c.writeMu.Lock()
@@ -119,10 +120,13 @@ func (c *Connection) Close() error {
 		_ = c.ws.SetWriteDeadline(time.Now().Add(writeTimeout))
 		_ = c.ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 		c.closeErr = c.ws.Close()
-		if c.onClose != nil {
-			c.onClose()
-		}
+		didClose = true
 	})
+	// The callback may close the MCP session, which closes this connection
+	// again. Invoke it after sync.Once has finished to allow that reentry.
+	if didClose && c.onClose != nil {
+		c.onClose()
+	}
 	return c.closeErr
 }
 
